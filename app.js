@@ -348,6 +348,12 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y, x + w, y, r);
   ctx.closePath();
 }
+// Labels ~40% of prior world size; animation loop re-scales for readable on-screen size.
+const LABEL_SIZE = 0.4;
+const LABEL_REF_ORBIT = 1.55; // fallback orbit distance used as screen-size reference
+const LABEL_COMP_MIN = 0.25;
+const LABEL_COMP_MAX = 2.2;
+
 function makeLabel(text, color = '#ffe9a8', scale = 1) {
   const c = document.createElement('canvas');
   const ctx = c.getContext('2d');
@@ -365,8 +371,30 @@ function makeLabel(text, color = '#ffe9a8', scale = 1) {
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
-  spr.scale.set((w / 520) * scale, (h / 520) * scale, 1);
+  const sx = (w / 520) * scale * LABEL_SIZE;
+  const sy = (h / 520) * scale * LABEL_SIZE;
+  spr.scale.set(sx, sy, 1);
+  spr.userData.isLabel = true;
+  spr.userData.baseSx = sx;
+  spr.userData.baseSy = sy;
   return spr;
+}
+
+function labelZoomCompensate() {
+  // AR: cancel floatRoot pinch scale (capped). Fallback: grow slightly with orbit distance.
+  if (mode === 'ar') {
+    return THREE.MathUtils.clamp(1 / Math.max(modelScale, 0.001), LABEL_COMP_MIN, LABEL_COMP_MAX);
+  }
+  return THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX);
+}
+
+function updateLabelSprites(root) {
+  const k = labelZoomCompensate();
+  root.traverse((c) => {
+    if (!c.isSprite || !c.userData.isLabel) return;
+    c.quaternion.copy(camera.quaternion);
+    c.scale.set(c.userData.baseSx * k, c.userData.baseSy * k, 1);
+  });
 }
 
 const sunTheta = 0.22;
@@ -982,11 +1010,7 @@ renderer.setAnimationLoop((time, frame) => {
   const labelParents = [];
   if (labelsVisible && galaxyRoot.visible) labelParents.push(labelsRoot);
   if (labelsVisible && localRoot.visible) labelParents.push(localLabels);
-  for (const root of labelParents) {
-    root.traverse((c) => {
-      if (c.isSprite) c.quaternion.copy(camera.quaternion);
-    });
-  }
+  for (const root of labelParents) updateLabelSprites(root);
 
   if (mode === 'ar' && frame && xrSession) {
     if (!hitTestSourceRequested) {
