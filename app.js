@@ -16,6 +16,8 @@ const infoEl = document.getElementById('info');
 const btnAR = document.getElementById('btnAR');
 const btnRecenter = document.getElementById('btnRecenter');
 const btnLabels = document.getElementById('btnLabels');
+const btnArms = document.getElementById('btnArms');
+const btnPivot = document.getElementById('btnPivot');
 const btnLocal = document.getElementById('btnLocal');
 const btnInfo = document.getElementById('btnInfo');
 const btnOrient = document.getElementById('btnOrient');
@@ -33,7 +35,28 @@ function setStatus(msg, hint = '') {
 let heightAboveFloor = DEFAULT_HEIGHT_M;
 let viewMode = 'galaxy'; // 'galaxy' | 'local'
 let labelsVisible = true;
+let armsVisible = true;
+let pivotMode = 'sun'; // 'sun' | 'galaxy' — AR/fallback placed point
 let infoOpen = false;
+
+function applyPivot() {
+  if (pivotMode === 'sun') {
+    pivotOffset.position.set(-sunPos.x, -sunPos.y, -sunPos.z);
+  } else {
+    pivotOffset.position.set(0, 0, 0);
+  }
+  if (btnPivot) {
+    btnPivot.textContent = pivotMode === 'sun' ? 'Centre: Sun' : 'Centre: Galaxy';
+    btnPivot.classList.toggle('on', pivotMode === 'sun');
+  }
+}
+
+function setArmsVisible(on) {
+  armsVisible = on;
+  armsRoot.visible = on;
+  armLabelsRoot.visible = on && labelsVisible;
+  btnArms.classList.toggle('on', on);
+}
 
 
 const renderer = new THREE.WebGLRenderer({
@@ -61,13 +84,25 @@ const floatRoot = new THREE.Group();
 floorAnchor.add(floatRoot);
 floatRoot.position.y = heightAboveFloor;
 
+// Content offset so the placed point can be the Sun (default) or galactic centre
+const pivotOffset = new THREE.Group();
+floatRoot.add(pivotOffset);
+// Slow spin around the current pivot (Sun or galactic centre)
+const spinRoot = new THREE.Group();
+pivotOffset.add(spinRoot);
+
 const galaxyRoot = new THREE.Group();
-floatRoot.add(galaxyRoot);
+spinRoot.add(galaxyRoot);
 const labelsRoot = new THREE.Group();
 galaxyRoot.add(labelsRoot);
+const armsRoot = new THREE.Group(); // spiral arms + arm nebulae (toggleable)
+galaxyRoot.add(armsRoot);
+const armLabelsRoot = new THREE.Group();
+labelsRoot.add(armLabelsRoot);
+
 const localRoot = new THREE.Group();
 localRoot.visible = false;
-floatRoot.add(localRoot);
+spinRoot.add(localRoot);
 const localLabels = new THREE.Group();
 localRoot.add(localLabels);
 
@@ -162,15 +197,16 @@ function addCloudSprites(parent, n, rng, sampler, map, baseScale) {
 }
 
 function buildGalaxy() {
-  const positions = [], colors = [], sizes = [];
+  const corePos = [], coreCol = [], coreSize = [];
+  const armPos = [], armCol = [], armSize = [];
   const rng = mulberry32(0x4d494c4b);
 
-  function pushStar(x, y, z, r, g, b, size) {
-    positions.push(x * M_PER_KPC, y * M_PER_KPC, z * M_PER_KPC);
-    colors.push(r, g, b); sizes.push(size);
+  function push(arrP, arrC, arrS, x, y, z, r, g, b, size) {
+    arrP.push(x * M_PER_KPC, y * M_PER_KPC, z * M_PER_KPC);
+    arrC.push(r, g, b); arrS.push(size);
   }
 
-  // Bulge
+  // Bulge (core)
   for (let i = 0; i < 14000; i++) {
     const rad = 1.9 * Math.pow(rng(), 0.55);
     const theta = 2 * Math.PI * rng();
@@ -179,9 +215,9 @@ function buildGalaxy() {
     const y = rad * Math.cos(phi) * 0.42;
     const z = rad * Math.sin(phi) * Math.sin(theta);
     const t = Math.min(1, Math.hypot(x, z) / 2.2);
-    pushStar(x, y, z, 1.0, 0.78 - 0.12 * t, 0.42 - 0.15 * t, 0.007 + rng() * 0.014);
+    push(corePos, coreCol, coreSize, x, y, z, 1.0, 0.78 - 0.12 * t, 0.42 - 0.15 * t, 0.007 + rng() * 0.014);
   }
-  // Bar
+  // Bar (core)
   for (let i = 0; i < 8000; i++) {
     const along = (rng() - 0.5) * 9.0;
     const width = (rng() - 0.5) * (1.0 + 0.12 * Math.abs(along));
@@ -189,9 +225,9 @@ function buildGalaxy() {
     const ang = 0.4;
     const x = along * Math.cos(ang) - width * Math.sin(ang);
     const z = along * Math.sin(ang) + width * Math.cos(ang);
-    pushStar(x, height, z, 1.0, 0.74 + rng() * 0.1, 0.4 + rng() * 0.1, 0.006 + rng() * 0.012);
+    push(corePos, coreCol, coreSize, x, height, z, 1.0, 0.74 + rng() * 0.1, 0.4 + rng() * 0.1, 0.006 + rng() * 0.012);
   }
-  // Arms denser
+  // Spiral arms (separate Points)
   for (const arm of ARMS) {
     const count = Math.floor(22000 * arm.weight);
     for (let i = 0; i < count; i++) {
@@ -211,11 +247,11 @@ function buildGalaxy() {
       if (young > 0.84) { cr = 0.65; cg = 0.85; cb = 1.0; }
       else if (young < 0.1) { cr = 1.0; cg = 0.55; cb = 0.32; }
       const bright = 0.55 + rng() * 0.45;
-      pushStar(x, h, z, cr * bright, cg * bright, cb * bright,
+      push(armPos, armCol, armSize, x, h, z, cr * bright, cg * bright, cb * bright,
         0.004 + rng() * 0.016 + (young > 0.92 ? 0.012 : 0));
     }
   }
-  // Orion spur
+  // Orion spur (with arms)
   for (let i = 0; i < 5000; i++) {
     const r = 7.2 + rng() * 2.2;
     const theta = 0.15 + (r - 7.2) * 0.08 + (rng() - 0.5) * 0.85;
@@ -223,19 +259,21 @@ function buildGalaxy() {
     const h = (rng() - 0.5) * 0.2;
     const x = r * Math.cos(theta) + w * Math.cos(theta + Math.PI / 2);
     const z = r * Math.sin(theta) + w * Math.sin(theta + Math.PI / 2);
-    pushStar(x, h, z, 0.85 + rng()*0.15, 0.9 + rng()*0.08, 1.0, 0.005 + rng()*0.014);
+    push(armPos, armCol, armSize, x, h, z, 0.85 + rng()*0.15, 0.9 + rng()*0.08, 1.0, 0.005 + rng()*0.014);
   }
-  // Field
+  // Field (core — stays when arms hidden)
   for (let i = 0; i < 18000; i++) {
     const r = 1.5 + 13.5 * Math.sqrt(rng());
     const theta = 2 * Math.PI * rng();
     const h = (rng() - 0.5) * (0.22 + 0.018 * r);
-    pushStar(r * Math.cos(theta), h, r * Math.sin(theta),
+    push(corePos, coreCol, coreSize, r * Math.cos(theta), h, r * Math.sin(theta),
       0.7 + rng()*0.3, 0.78 + rng()*0.18, 0.95, 0.003 + rng()*0.008);
   }
 
-  const stars = makePoints(positions, colors, sizes, 0.92);
-  galaxyRoot.add(stars);
+  const coreStars = makePoints(corePos, coreCol, coreSize, 0.92);
+  galaxyRoot.add(coreStars);
+  const armStars = makePoints(armPos, armCol, armSize, 0.92);
+  armsRoot.add(armStars);
 
   // Bulge glow sprite
   const bulgeSpr = new THREE.Sprite(new THREE.SpriteMaterial({
@@ -245,8 +283,8 @@ function buildGalaxy() {
   bulgeSpr.scale.set(0.22, 0.14, 1);
   galaxyRoot.add(bulgeSpr);
 
-  // Nebula / dust lanes along arms
-  addCloudSprites(galaxyRoot, 48, rng, (rng) => {
+  // Nebula / dust / HII along arms → armsRoot
+  addCloudSprites(armsRoot, 48, rng, (rng) => {
     const arm = ARMS[Math.floor(rng() * ARMS.length)];
     const theta = arm.phase + (0.8 + rng() * 2.8) * Math.PI;
     let r = Math.min(13, Math.max(3.5, armRadius(arm, theta)));
@@ -258,7 +296,7 @@ function buildGalaxy() {
     };
   }, nebulaTex, 0.08);
 
-  addCloudSprites(galaxyRoot, 36, rng, (rng) => {
+  addCloudSprites(armsRoot, 36, rng, (rng) => {
     const arm = ARMS[Math.floor(rng() * ARMS.length)];
     const theta = arm.phase + (0.5 + rng() * 3.0) * Math.PI;
     let r = Math.min(12.5, Math.max(3, armRadius(arm, theta)));
@@ -269,8 +307,7 @@ function buildGalaxy() {
     };
   }, dustTex, 0.07);
 
-  // HII pink knots
-  addCloudSprites(galaxyRoot, 28, rng, (rng) => {
+  addCloudSprites(armsRoot, 28, rng, (rng) => {
     const arm = ARMS[Math.floor(rng() * ARMS.length)];
     const theta = arm.phase + (1.0 + rng() * 2.5) * Math.PI;
     let r = Math.min(12, Math.max(4, armRadius(arm, theta)));
@@ -281,7 +318,7 @@ function buildGalaxy() {
     };
   }, hiiTex, 0.045);
 
-  // Soft disc
+  // Soft disc (stays with core)
   const disc = new THREE.Mesh(
     new THREE.RingGeometry(0.015, GALAXY_DIAMETER_M * 0.52, 96),
     new THREE.MeshBasicMaterial({
@@ -292,10 +329,14 @@ function buildGalaxy() {
   disc.rotation.x = -Math.PI / 2;
   galaxyRoot.add(disc);
 
-  return { starCount: positions.length / 3, bulgeSpr };
+  return {
+    starCount: (corePos.length + armPos.length) / 3,
+    armStarCount: armPos.length / 3,
+    bulgeSpr,
+  };
 }
 
-const { starCount, bulgeSpr } = buildGalaxy();
+const { starCount, armStarCount, bulgeSpr } = buildGalaxy();
 
 // ——— Labels ———
 function roundRect(ctx, x, y, w, h, r) {
@@ -469,7 +510,7 @@ for (const L of [
   let r = Math.min(12.5, Math.max(4, armRadius(L.arm, theta)));
   const spr = makeLabel(L.name, '#cfe0ff', 0.85);
   spr.position.set(r * Math.cos(theta) * M_PER_KPC, 0.03, r * Math.sin(theta) * M_PER_KPC);
-  labelsRoot.add(spr);
+  armLabelsRoot.add(spr);
 }
 
 // ——— Local neighbourhood view (1 kpc → 2 m) ———
@@ -556,6 +597,8 @@ function buildLocalView() {
 buildLocalView();
 // Place localRoot at Sun's galactocentric position (same as galaxy sun)
 localRoot.position.copy(sunPos);
+applyPivot(); // default: Sun at the placed/floor-anchor point
+
 
 function applyHeight() {
   floatRoot.position.y = heightAboveFloor;
@@ -816,14 +859,14 @@ function onSelectPlace() {
     floorAnchor.visible = true;
     placed = true; reticle.visible = false;
     applyHeight();
-    setStatus('Placed · galaxy floats above the floor', `Height ${heightAboveFloor.toFixed(2)} m · adjust with slider.`);
+    setStatus(`Placed · ${pivotMode === 'sun' ? 'Sun' : 'galactic centre'} at anchor`, `Height ${heightAboveFloor.toFixed(2)} m · Arms / Centre toggles available.`);
   } else {
     const cam = renderer.xr.getCamera();
     const pos = new THREE.Vector3(), quat = new THREE.Quaternion();
     cam.getWorldPosition(pos); cam.getWorldQuaternion(quat);
     placeGalaxyInFront(pos, quat);
     placed = true;
-    setStatus('Placed (~0.5 m ahead, floating)', `Height ${heightAboveFloor.toFixed(2)} m.`);
+    setStatus(`Placed (~0.5 m) · ${pivotMode === 'sun' ? 'Sun' : 'centre'} anchored`, `Height ${heightAboveFloor.toFixed(2)} m.`);
   }
 }
 
@@ -890,7 +933,17 @@ btnLabels.addEventListener('click', () => {
   labelsVisible = !labelsVisible;
   labelsRoot.visible = labelsVisible;
   localLabels.visible = labelsVisible;
+  armLabelsRoot.visible = labelsVisible && armsVisible;
   btnLabels.classList.toggle('on', labelsVisible);
+});
+btnArms.addEventListener('click', () => setArmsVisible(!armsVisible));
+btnPivot.addEventListener('click', () => {
+  pivotMode = pivotMode === 'sun' ? 'galaxy' : 'sun';
+  applyPivot();
+  setStatus(
+    pivotMode === 'sun' ? 'Anchor: Sun' : 'Anchor: galactic centre',
+    'Pinch scale pivots on the placed centre · Recenter to re-place.'
+  );
 });
 btnLocal.addEventListener('click', () => setViewMode(viewMode === 'local' ? 'galaxy' : 'local'));
 btnInfo.addEventListener('click', () => {
@@ -923,14 +976,16 @@ window.addEventListener('resize', () => {
 const clock = new THREE.Clock();
 renderer.setAnimationLoop((time, frame) => {
   const t = clock.getElapsedTime();
-  galaxyRoot.rotation.y = t * 0.012; // slow spin
+  spinRoot.rotation.y = t * 0.012; // slow spin around current pivot
   if (bulgeSpr) bulgeSpr.material.opacity = 0.45 + 0.12 * Math.sin(t * 0.7);
 
   const labelParents = [];
   if (labelsVisible && galaxyRoot.visible) labelParents.push(labelsRoot);
   if (labelsVisible && localRoot.visible) labelParents.push(localLabels);
   for (const root of labelParents) {
-    for (const c of root.children) c.quaternion.copy(camera.quaternion);
+    root.traverse((c) => {
+      if (c.isSprite) c.quaternion.copy(camera.quaternion);
+    });
   }
 
   if (mode === 'ar' && frame && xrSession) {
