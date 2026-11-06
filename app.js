@@ -20,6 +20,8 @@ const btnArms = document.getElementById('btnArms');
 const btnPivot = document.getElementById('btnPivot');
 const btnLocal = document.getElementById('btnLocal');
 const btnInfo = document.getElementById('btnInfo');
+const btnDebug = document.getElementById('btnDebug');
+const debugLine = document.getElementById('debugLine');
 const btnOrient = document.getElementById('btnOrient');
 const heightSlider = document.getElementById('heightSlider');
 const heightVal = document.getElementById('heightVal');
@@ -160,25 +162,27 @@ function armRadius(arm, theta) {
 }
 
 // Field-star zoom compensation (AR modelScale + fallback cam distance).
-// Sun / sibling markers are constant screen-size points (see makeScreenMarker).
+// Sun / sibling markers are FOV-scaled billboard quads (see makeScreenMarker / updateScreenMarkers).
 const starPointMats = [];
-const screenMarkers = []; // Groups wrapping fixed-px Points (Sun, siblings)
+const screenMarkers = []; // Groups with camera-facing Plane meshes
 const trackedLabels = []; // { marker, label, dxPx, dyPx } — labels follow markers each frame
 const POINT_SIZE_MIN_PX = 0.7;
 const POINT_SIZE_MAX_PX = 12.0;
 const ZOOM_REF_ORBIT = 1.55; // matches default camOrbitDist
-const SUN_MARKER_PX = 15;   // CSS px before DPR / markerSizeMul
-const SIB_MARKER_PX = 9;
+const SUN_SCREEN_FRAC = 0.025; // ~2.5% of vertical FOV at markerSizeMul = 1
+const SIB_SIZE_FRAC = 0.6;     // siblings = 60% of Sun angular size
 const MARKER_SIZE_DEFAULT = 1;
 let markerSizeMul = MARKER_SIZE_DEFAULT;
+let debugVisible = false;
 const _lblWp = new THREE.Vector3();
 const _lblNdc = new THREE.Vector3();
 const _lblScr = new THREE.Vector3();
 const _lblLocal = new THREE.Vector3();
+const _mkCamPos = new THREE.Vector3();
+const _mkWp = new THREE.Vector3();
+const _mkQuat = new THREE.Quaternion();
 
 function getWorldZoomScale() {
-  // AR: pinch scales scaleRoot. Fallback: closer camera ≈ larger on-screen size.
-  // Only call after mode / modelScale / camOrbitDist are initialized.
   if (mode === 'ar') return Math.max(modelScale, 0.05);
   return Math.max(ZOOM_REF_ORBIT / Math.max(camOrbitDist, 0.05), 0.05);
 }
@@ -188,13 +192,84 @@ function applyZoomCompensate() {
   for (const mat of starPointMats) {
     if (mat.uniforms.uWorldScale) mat.uniforms.uWorldScale.value = z;
   }
-  // Keep screen-marker pixel size in sync with the active renderer (incl. WebXR)
-  const pr = Math.min(renderer.getPixelRatio(), 2);
+}
+
+/** Read Markers slider every frame (dom-overlay / XR-safe). */
+function readMarkerSizeSlider() {
+  if (!markerSizeSlider) return;
+  const v = parseFloat(markerSizeSlider.value);
+  if (!Number.isFinite(v)) return;
+  if (v !== markerSizeMul) {
+    markerSizeMul = v;
+    if (markerSizeVal) markerSizeVal.textContent = markerSizeMul.toFixed(2) + '×';
+  }
+}
+
+/** Active rendering camera (XR ArrayCamera / eye when presenting). */
+function getActiveCameras() {
+  if (mode === 'ar' && renderer.xr && renderer.xr.isPresenting) {
+    const xrCam = renderer.xr.getCamera();
+    const eyes = xrCam.cameras && xrCam.cameras.length ? xrCam.cameras : [xrCam];
+    return { head: xrCam, eyes };
+  }
+  return { head: camera, eyes: [camera] };
+}
+
+function verticalFovRad(cam) {
+  // Prefer projection matrix (correct for WebXR eye cameras)
+  const m5 = Math.abs(cam.projectionMatrix.elements[5]);
+  if (m5 > 1e-8) return 2 * Math.atan(1 / m5);
+  if (cam.fov) return THREE.MathUtils.degToRad(cam.fov);
+  return THREE.MathUtils.degToRad(65);
+}
+
+/**
+ * Size + face billboard markers from distance to the XR/fallback camera so the
+ * Sun covers SUN_SCREEN_FRAC × markerSizeMul of the vertical FOV.
+ */
+function updateScreenMarkers() {
+  readMarkerSizeSlider();
+  const { head, eyes } = getActiveCameras();
+  head.updateMatrixWorld(true);
+  const eye = eyes[0];
+  eye.updateMatrixWorld(true);
+  const vFov = verticalFovRad(eye);
+  head.getWorldPosition(_mkCamPos);
+  head.getWorldQuaternion(_mkQuat);
+
+  let lastWorldH = 0;
+  let lastDist = 0;
   for (const g of screenMarkers) {
-    const pts = g.userData.markerPoints;
-    if (!pts?.material?.uniforms) continue;
-    pts.material.uniforms.uPixelRatio.value = pr;
-    pts.material.uniforms.uPixelSize.value = (g.userData.basePixelSize || SUN_MARKER_PX) * markerSizeMul;
+    const mesh = g.userData.markerMesh;
+    if (!mesh) continue;
+    g.updateWorldMatrix(true, false);
+    g.getWorldPosition(_mkWp);
+    const dist = Math.max(0.08, _mkWp.distanceTo(_mkCamPos));
+    const frac = SUN_SCREEN_FRAC * markerSizeMul * (g.userData.sizeFrac || 1);
+    const worldH = 2 * dist * Math.tan(vFov * 0.5) * frac;
+    mesh.scale.set(worldH, worldH, 1);
+    // Face the viewer (works for XR head / mono camera)
+    mesh.quaternion.copy(_mkQuat);
+    if (g === sunGroup) { lastWorldH = worldH; lastDist = dist; }
+  }
+
+  if (debugVisible && debugLine) {
+    const gl = renderer.getContext();
+    let ptRange = '?';
+    try {
+      const r = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE);
+      ptRange = `[${r[0]}, ${r[1]}]`;
+    } catch (_) {}
+    const fbW = renderer.domElement.width;
+    const fbH = renderer.domElement.height;
+    const xrOn = !!(renderer.xr && renderer.xr.isPresenting);
+    const screenFrac = lastDist > 0
+      ? lastWorldH / (2 * lastDist * Math.tan(vFov * 0.5))
+      : 0;
+    debugLine.textContent =
+      `fb ${fbW}×${fbH} · XR ${xrOn ? 'on' : 'off'} · ptRange ${ptRange}` +
+      ` · Markers ${markerSizeMul.toFixed(2)}× · FOVy ${(vFov * 180 / Math.PI).toFixed(1)}°` +
+      ` · SunFrac ${(screenFrac * 100).toFixed(2)}% · dist ${lastDist.toFixed(2)} m`;
   }
 }
 
@@ -628,68 +703,60 @@ function makeMarker(color, radius = 0.006) {
 }
 
 /**
- * Constant screen-size marker (Sun / siblings).
- * Bright core + soft ring in the fragment shader; gl_PointSize = basePx × mul × DPR.
+ * Camera-facing billboard marker (Sun / siblings).
+ * Opaque yellow/coloured core + dark outline + soft glow; NormalBlending (readable on XR camera feed).
+ * World size is set each frame in updateScreenMarkers from distance × vertical FOV.
  */
-function makeScreenMarker(color, pixelSize, { coreColor = 0xffffff } = {}) {
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3));
+function makeScreenMarker(color, { coreColor = 0xffffff, sizeFrac = 1 } = {}) {
+  const geo = new THREE.PlaneGeometry(1, 1);
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uColor: { value: new THREE.Color(color) },
       uCoreColor: { value: new THREE.Color(coreColor) },
-      uPixelSize: { value: pixelSize * markerSizeMul },
-      uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 2) },
     },
     vertexShader: `
-      uniform float uPixelSize;
-      uniform float uPixelRatio;
+      varying vec2 vUv;
       void main() {
-        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-        gl_PointSize = max(2.0, uPixelSize * uPixelRatio);
-        gl_Position = projectionMatrix * mvPosition;
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }`,
     fragmentShader: `
+      varying vec2 vUv;
       uniform vec3 uColor;
       uniform vec3 uCoreColor;
       void main() {
-        vec2 uv = gl_PointCoord - vec2(0.5);
-        float r = length(uv) * 2.0; // 0 centre → 1 rim
-        float core = smoothstep(0.42, 0.0, r);
-        float ring = smoothstep(0.22, 0.52, r) * smoothstep(1.0, 0.62, r);
-        float a = max(core, ring * 0.9);
-        if (a < 0.03) discard;
+        vec2 p = vUv - vec2(0.5);
+        float r = length(p) * 2.0;
+        float core = smoothstep(0.38, 0.0, r);
+        // dark outline just outside the core
+        float outline = smoothstep(0.50, 0.40, r) * smoothstep(0.32, 0.40, r);
+        float glow = smoothstep(1.0, 0.45, r) * (1.0 - core) * 0.65;
+        float a = max(core, max(outline, glow));
+        if (a < 0.04) discard;
         vec3 col = mix(uColor, uCoreColor, core);
+        col = mix(col, vec3(0.04, 0.03, 0.02), outline);
         gl_FragColor = vec4(col, a);
       }`,
     transparent: true,
-    depthWrite: false,
     depthTest: false,
-    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+    blending: THREE.NormalBlending,
+    side: THREE.DoubleSide,
   });
-  const pts = new THREE.Points(geo, mat);
-  pts.frustumCulled = false;
-  pts.renderOrder = 10;
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = 999;
   const g = new THREE.Group();
-  g.add(pts);
+  g.add(mesh);
   g.userData.isScreenMarker = true;
-  g.userData.basePixelSize = pixelSize;
-  g.userData.pixelSize = pixelSize;
-  g.userData.markerPoints = pts;
+  g.userData.markerMesh = mesh;
+  g.userData.sizeFrac = sizeFrac;
   screenMarkers.push(g);
   return g;
 }
 
-/** Effective gl_PointSize in framebuffer pixels for a screen marker. */
-function screenMarkerFbPx(g) {
-  const pts = g.userData.markerPoints;
-  if (!pts?.material?.uniforms) return null;
-  const u = pts.material.uniforms;
-  return u.uPixelSize.value * u.uPixelRatio.value;
-}
-
-// Sun in galaxy view — ~15 CSS px × mul × DPR, bright core + soft ring
-const sunGroup = makeScreenMarker(0xffe566, SUN_MARKER_PX, { coreColor: 0xfff6c8 });
+// Sun in galaxy view — FOV-scaled billboard
+const sunGroup = makeScreenMarker(0xffe566, { coreColor: 0xfff8d0, sizeFrac: 1 });
 sunGroup.position.copy(sunPos);
 galaxyRoot.add(sunGroup);
 const sunLabel = makeLabel('Sun · Orion Spur · 8.2 kpc', '#ffe9a8');
@@ -740,7 +807,7 @@ trackLabel(birthMarker, birthLabel, 14, -16);
 // Galaxy-view sibling markers (tiny at disc scale — still placed truthfully)
 for (const sib of SIBLINGS) {
   const p = helioToWorld(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-  const m = makeScreenMarker(sib.color, SIB_MARKER_PX, { coreColor: sib.coreColor });
+  const m = makeScreenMarker(sib.color, { coreColor: sib.coreColor, sizeFrac: SIB_SIZE_FRAC });
   m.position.copy(p);
   galaxyRoot.add(m);
   const lab = makeLabel(sib.id, '#d0e8ff', 0.75);
@@ -814,7 +881,7 @@ function buildLocalView() {
   localRoot.add(pts);
 
   // Local Sun at origin of localRoot (we place localRoot at sun galactocentric later)
-  const localSun = makeScreenMarker(0xffe566, SUN_MARKER_PX, { coreColor: 0xfff6c8 });
+  const localSun = makeScreenMarker(0xffe566, { coreColor: 0xfff8d0, sizeFrac: 1 });
   localRoot.add(localSun);
   const ls = makeLabel('Sun', '#ffe9a8', 1.2);
   localLabels.add(ls);
@@ -833,7 +900,7 @@ function buildLocalView() {
 
   for (const sib of SIBLINGS) {
     const p = helioToLocal(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-    const m = makeScreenMarker(sib.color, SIB_MARKER_PX, { coreColor: sib.coreColor });
+    const m = makeScreenMarker(sib.color, { coreColor: sib.coreColor, sizeFrac: SIB_SIZE_FRAC });
     m.position.copy(p);
     localRoot.add(m);
     const line = new THREE.Line(
@@ -873,14 +940,19 @@ labelSizeSlider.addEventListener('input', () => {
 labelSizeMul = parseFloat(labelSizeSlider.value) || LABEL_SIZE_DEFAULT;
 labelSizeVal.textContent = labelSizeMul.toFixed(2) + '×';
 
-markerSizeSlider.addEventListener('input', () => {
-  markerSizeMul = parseFloat(markerSizeSlider.value);
+function onMarkerSizeInput(e) {
+  if (e) e.stopPropagation();
+  const v = parseFloat(markerSizeSlider.value);
+  if (!Number.isFinite(v)) return;
+  markerSizeMul = v;
   markerSizeVal.textContent = markerSizeMul.toFixed(2) + '×';
-  applyZoomCompensate();
-});
+}
+['input', 'change'].forEach((ev) => markerSizeSlider.addEventListener(ev, onMarkerSizeInput));
+markerSizeSlider.addEventListener('pointerdown', (e) => e.stopPropagation());
+markerSizeSlider.addEventListener('pointerup', onMarkerSizeInput);
+markerSizeSlider.addEventListener('touchstart', (e) => e.stopPropagation(), { passive: true });
 markerSizeMul = parseFloat(markerSizeSlider.value) || MARKER_SIZE_DEFAULT;
 markerSizeVal.textContent = markerSizeMul.toFixed(2) + '×';
-// applyZoomCompensate runs from the animation loop once mode/modelScale exist
 
 /** Headless / debug: apply AR label layout and measure matrixWorld height. */
 globalThis.__measureArLabelWorld = (mul = 1, scale = 1) => {
@@ -955,12 +1027,14 @@ globalThis.__measureSunPivot = () => {
 globalThis.__getLabelSizing = () => globalThis.__measureArLabelWorld(labelSizeMul, modelScale);
 globalThis.__zoomDiag = () => {
   applyZoomCompensate();
+  updateScreenMarkers();
+  const mesh = sunGroup.userData.markerMesh;
   return {
     worldZoom: getWorldZoomScale(),
     screenMarkerCount: screenMarkers.length,
     matCount: starPointMats.length,
     uWorldScale: starPointMats[0]?.uniforms?.uWorldScale?.value ?? null,
-    sunFbPx: screenMarkerFbPx(sunGroup),
+    sunWorldH: mesh ? mesh.scale.y : null,
     markerSizeMul,
     trackedLabels: trackedLabels.length,
     modelScale,
@@ -975,51 +1049,69 @@ globalThis.__zoomDiag = () => {
  * size-attenuation-free points, including under WebXR's projection matrix.
  */
 globalThis.__measureMarkerPixels = () => {
+  // Simulate a large XR-like framebuffer and FOV-scaled Sun billboard.
   const prevMode = mode;
   const prevScale = modelScale;
   const prevSpin = spinRoot.rotation.y;
+  const prevMul = markerSizeMul;
+  const prevSize = { w: renderer.domElement.width, h: renderer.domElement.height };
   const prevCam = {
     pos: camera.position.clone(),
     quat: camera.quaternion.clone(),
-    near: camera.near,
-    far: camera.far,
+    aspect: camera.aspect,
+    fov: camera.fov,
   };
+
   mode = 'ar';
   spinRoot.rotation.y = 0;
   applyPivot();
   placeFallbackDefault();
   floorAnchor.visible = true;
+  renderer.setSize(2400, 1080, false);
+  camera.aspect = 2400 / 1080;
+  camera.fov = 65;
+  camera.updateProjectionMatrix();
 
   const samples = [];
-  for (const s of [1, 5, 20]) {
+  for (const mul of [1, 2]) {
     for (const dist of [0.1, 1.0]) {
-      modelScale = s;
+      markerSizeMul = mul;
+      if (markerSizeSlider) markerSizeSlider.value = String(mul);
+      if (markerSizeVal) markerSizeVal.textContent = mul.toFixed(2) + '×';
+      modelScale = 1;
       applyModelScale();
-      // Place camera along +Z looking at the anchored Sun (floatRoot origin ≈ Sun)
       const anchor = new THREE.Vector3();
+      floorAnchor.updateWorldMatrix(true, true);
       floorAnchor.getWorldPosition(anchor);
       anchor.y += heightAboveFloor;
       camera.position.set(anchor.x, anchor.y, anchor.z + dist);
       camera.lookAt(anchor);
       camera.updateMatrixWorld(true);
-      floorAnchor.updateWorldMatrix(true, true);
-      applyZoomCompensate();
+      updateScreenMarkers();
 
-      const fbPx = screenMarkerFbPx(sunGroup);
-      // Also project Sun world → NDC → CSS pixels (extent of a 0-radius point is the gl_PointSize)
+      const mesh = sunGroup.userData.markerMesh;
       sunGroup.updateWorldMatrix(true, false);
       const wp = new THREE.Vector3();
       sunGroup.getWorldPosition(wp);
-      const ndc = wp.clone().project(camera);
-      const halfW = renderer.domElement.clientWidth / 2;
-      const halfH = renderer.domElement.clientHeight / 2;
+      const camPos = new THREE.Vector3();
+      camera.getWorldPosition(camPos);
+      const d = wp.distanceTo(camPos);
+      const vFov = verticalFovRad(camera);
+      const worldH = mesh.scale.y;
+      const frac = worldH / (2 * d * Math.tan(vFov * 0.5));
+      // Project top/bottom of billboard approx via worldH along camera up
+      const halfH = worldH / 2;
+      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+      const top = wp.clone().addScaledVector(up, halfH).project(camera);
+      const bot = wp.clone().addScaledVector(up, -halfH).project(camera);
+      const cssH = renderer.domElement.clientHeight || 1080;
+      const coverCss = Math.abs(top.y - bot.y) * 0.5 * cssH; // NDC y span → css px
+      const coverFrac = Math.abs(top.y - bot.y) / 2; // fraction of NDC [-1,1] height
       samples.push({
-        modelScale: s,
-        camDist_m: dist,
-        glPointSize_fbPx: fbPx,
-        glPointSize_cssPx: fbPx / Math.min(renderer.getPixelRatio(), 2),
-        ndc: { x: ndc.x, y: ndc.y, z: ndc.z },
-        screenPx: { x: ndc.x * halfW + halfW, y: -ndc.y * halfH + halfH },
+        mul, camDist_m: dist, worldH, dist_m: d,
+        fovFrac: frac, coverNdcFrac: coverFrac,
+        coverPct: coverFrac * 100,
+        expectedPct: SUN_SCREEN_FRAC * mul * 100,
       });
     }
   }
@@ -1029,27 +1121,29 @@ globalThis.__measureMarkerPixels = () => {
   modelScale = prevScale;
   applyModelScale();
   spinRoot.rotation.y = prevSpin;
+  markerSizeMul = prevMul;
+  if (markerSizeSlider) markerSizeSlider.value = String(prevMul);
+  if (markerSizeVal) markerSizeVal.textContent = prevMul.toFixed(2) + '×';
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
   camera.position.copy(prevCam.pos);
   camera.quaternion.copy(prevCam.quat);
-  camera.near = prevCam.near;
-  camera.far = prevCam.far;
+  camera.aspect = prevCam.aspect;
+  camera.fov = prevCam.fov;
   camera.updateProjectionMatrix();
 
-  const sizes = samples.map((s) => s.glPointSize_fbPx);
-  const minS = Math.min(...sizes);
-  const maxS = Math.max(...sizes);
+  const at1 = samples.filter((s) => s.mul === 1);
+  const at2 = samples.filter((s) => s.mul === 2);
+  const mean1 = at1.reduce((a, s) => a + s.coverPct, 0) / at1.length;
+  const mean2 = at2.reduce((a, s) => a + s.coverPct, 0) / at2.length;
   return {
-    sunCssPx: SUN_MARKER_PX,
-    sibCssPx: SIB_MARKER_PX,
-    markerSizeMul,
     samples,
-    minFbPx: minS,
-    maxFbPx: maxS,
-    constant: Math.abs(maxS - minS) < 1e-6,
+    meanCoverPct_1x: mean1,
+    meanCoverPct_2x: mean2,
+    inRange1x: mean1 >= 2 && mean1 <= 3.5,
+    sliderDoubles: mean2 > mean1 * 1.7 && mean2 < mean1 * 2.4,
   };
 };
 
-/** Screen-space px distance between Sun marker and its label across modelScales. */
 globalThis.__measureLabelFollow = () => {
   const prevMode = mode;
   const prevScale = modelScale;
@@ -1073,6 +1167,7 @@ globalThis.__measureLabelFollow = () => {
       camera.lookAt(anchor);
       camera.updateMatrixWorld(true);
       applyZoomCompensate();
+      updateScreenMarkers();
       syncTrackedLabels();
       updateLabelSprites(labelsRoot);
 
@@ -1451,6 +1546,12 @@ btnInfo.addEventListener('click', () => {
   infoEl.classList.toggle('show', infoOpen);
   btnInfo.classList.toggle('on', infoOpen);
 });
+btnDebug.addEventListener('click', () => {
+  debugVisible = !debugVisible;
+  debugLine.classList.toggle('is-hidden', !debugVisible);
+  btnDebug.classList.toggle('on', debugVisible);
+  if (debugVisible) updateScreenMarkers();
+});
 btnOrient.addEventListener('click', () => permOverlay.classList.add('show'));
 btnPerm.addEventListener('click', async () => {
   const ok = await enableOrientation();
@@ -1479,6 +1580,7 @@ renderer.setAnimationLoop((time, frame) => {
   spinRoot.rotation.y = t * 0.012; // slow spin around current pivot
   if (bulgeSpr) bulgeSpr.material.opacity = 0.45 + 0.12 * Math.sin(t * 0.7);
   applyZoomCompensate();
+  updateScreenMarkers();
   syncTrackedLabels();
 
   const labelParents = [];

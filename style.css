@@ -64,3 +64,10 @@ html, body {
 
 /* Toggled from JS via classList (no inline style attributes) */
 .is-hidden { display: none !important; }
+
+#debugLine {
+  margin-top: 6px; font-size: 11px; line-height: 1.35; opacity: 0.85;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-shadow: 0 1px 3px #000; max-width: 42rem; word-break: break-word;
+}
+#ui label.slider input { touch-action: none; }
