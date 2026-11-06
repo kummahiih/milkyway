@@ -76,7 +76,7 @@ renderer.setClearColor(0x000000, 1);
 renderer.sortObjects = true;
 
 const scene = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.01, 50);
+const camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.001, 1e5);
 camera.position.set(0, 1.4, 0.8);
 
 scene.add(new THREE.AmbientLight(0x6688aa, 0.4));
@@ -239,18 +239,29 @@ function updateScreenMarkers() {
 
   let lastWorldH = 0;
   let lastDist = 0;
+  let lastParentSy = 1;
   for (const g of screenMarkers) {
     const mesh = g.userData.markerMesh;
     if (!mesh) continue;
+    // World position of the marker (Sun stays at scaleRoot origin → float-safe)
     g.updateWorldMatrix(true, false);
     g.getWorldPosition(_mkWp);
-    const dist = Math.max(0.08, _mkWp.distanceTo(_mkCamPos));
+    const dist = Math.max(0.05, _mkWp.distanceTo(_mkCamPos));
     const frac = SUN_SCREEN_FRAC * markerSizeMul * (g.userData.sizeFrac || 1);
     const worldH = 2 * dist * Math.tan(vFov * 0.5) * frac;
-    mesh.scale.set(worldH, worldH, 1);
-    // Face the viewer (works for XR head / mono camera)
+    // CRITICAL: mesh.scale is LOCAL; scaleRoot (modelScale) is an ancestor.
+    // local = desiredWorld / parentWorldScale so on-screen size stays constant when pinching.
+    const parentSy = parentWorldScaleY(mesh);
+    const local = worldH / parentSy;
+    mesh.scale.set(local, local, 1);
     mesh.quaternion.copy(_mkQuat);
-    if (g === sunGroup) { lastWorldH = worldH; lastDist = dist; }
+    if (g === sunGroup) {
+      mesh.updateWorldMatrix(true, false);
+      mesh.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _worldScale);
+      lastWorldH = Math.abs(_worldScale.y);
+      lastDist = dist;
+      lastParentSy = parentSy;
+    }
   }
 
   if (debugVisible && debugLine) {
@@ -268,8 +279,9 @@ function updateScreenMarkers() {
       : 0;
     debugLine.textContent =
       `fb ${fbW}×${fbH} · XR ${xrOn ? 'on' : 'off'} · ptRange ${ptRange}` +
-      ` · Markers ${markerSizeMul.toFixed(2)}× · FOVy ${(vFov * 180 / Math.PI).toFixed(1)}°` +
-      ` · SunFrac ${(screenFrac * 100).toFixed(2)}% · dist ${lastDist.toFixed(2)} m`;
+      ` · Markers ${markerSizeMul.toFixed(2)}× · scale ${modelScale.toFixed(0)}×` +
+      ` · FOVy ${(vFov * 180 / Math.PI).toFixed(1)}° · SunFrac ${(screenFrac * 100).toFixed(2)}%` +
+      ` · parentSy ${lastParentSy.toFixed(2)} · dist ${lastDist.toFixed(2)} m`;
   }
 }
 
@@ -573,59 +585,62 @@ function parentWorldScaleY(obj) {
 }
 
 function updateLabelSprites(root) {
-  if (mode === 'ar') {
-    const worldH = AR_LABEL_LINE_M * labelSizeMul;
-    let sample = null;
-    root.traverse((c) => {
-      if (!c.isSprite || !c.userData.isLabel) return;
-      c.quaternion.copy(camera.quaternion);
-      const parentSy = parentWorldScaleY(c); // includes scaleRoot / any other parents
-      const hWorld = worldH;
-      const wWorld = hWorld * (c.userData.aspect || 1);
-      c.scale.set(wWorld / parentSy, hWorld / parentSy, 1);
-      if (!sample) {
-        c.updateWorldMatrix(true, false);
-        c.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _worldScale);
-        sample = {
-          textAspect: c.userData.aspect,
-          canvasW: c.userData.canvasW,
-          canvasH: c.userData.canvasH,
-          localSx: c.scale.x,
-          localSy: c.scale.y,
-          parentSy,
-          matrixWorldSy: Math.abs(_worldScale.y),
-          targetWorldH: hWorld,
-          modelScale,
-          scaleRootScale: scaleRoot.scale.x,
-          sizeAttenuation: c.material.sizeAttenuation,
-        };
-      }
-    });
-    if (sample) {
-      const key = `${sample.targetWorldH.toFixed(4)}@${modelScale.toFixed(3)}x${labelSizeMul.toFixed(2)}`;
-      if (key !== arLabelSizeLog.lastKey) {
-        arLabelSizeLog.lastKey = key;
-        arLabelSizeLog.samples.push(sample);
-        console.info(
-          `[labels:AR] targetH=${sample.targetWorldH.toFixed(4)} m (${(sample.targetWorldH * 100).toFixed(2)} cm)` +
-          ` matrixWorld.sy=${sample.matrixWorldSy.toFixed(5)}` +
-          ` localSy=${sample.localSy.toFixed(5)} parentSy=${sample.parentSy.toFixed(5)}` +
-          ` modelScale=${sample.modelScale.toFixed(3)} mul=${labelSizeMul.toFixed(2)}` +
-          ` sizeAttenuation=${sample.sizeAttenuation}` +
-          ` canvas ${sample.canvasW}×${sample.canvasH}`
-        );
-        globalThis.__arLabelSize = sample;
-      }
-    }
-    return;
-  }
+  const { head } = getActiveCameras();
+  head.updateMatrixWorld(true);
+  head.getWorldQuaternion(_mkQuat);
+  head.getWorldPosition(_mkCamPos);
 
-  const k = THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX) * labelSizeMul;
+  // Desired WORLD height: FOV-scaled so labels stay readable at extreme pinch zoom,
+  // still modulated by the Label size slider. Floor with a tiny metric size.
+  const eye = getActiveCameras().eyes[0];
+  const vFov = verticalFovRad(eye);
+  const LABEL_SCREEN_FRAC = 0.012; // ~1.2% of FOV at labelSizeMul = 1
+
+  let sample = null;
   root.traverse((c) => {
     if (!c.isSprite || !c.userData.isLabel) return;
-    c.quaternion.copy(camera.quaternion);
-    c.scale.set(c.userData.fbSx * k, c.userData.fbSy * k, 1);
+    c.quaternion.copy(_mkQuat);
+    c.getWorldPosition(_lblWp);
+    const dist = Math.max(0.05, _lblWp.distanceTo(_mkCamPos));
+    const fovH = 2 * dist * Math.tan(vFov * 0.5) * LABEL_SCREEN_FRAC * labelSizeMul;
+    // Also respect the previous metric AR plate size as a soft reference blend in fallback
+    const metricH = AR_LABEL_LINE_M * labelSizeMul;
+    const hWorld = (mode === 'ar') ? Math.max(fovH, metricH * 0.15) : Math.max(
+      metricH * THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX),
+      fovH * 0.5
+    );
+    const wWorld = hWorld * (c.userData.aspect || 1);
+    const parentSy = parentWorldScaleY(c);
+    c.scale.set(wWorld / parentSy, hWorld / parentSy, 1);
+    if (!sample) {
+      c.updateWorldMatrix(true, false);
+      c.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _worldScale);
+      sample = {
+        textAspect: c.userData.aspect,
+        canvasW: c.userData.canvasW,
+        canvasH: c.userData.canvasH,
+        localSy: c.scale.y,
+        parentSy,
+        matrixWorldSy: Math.abs(_worldScale.y),
+        targetWorldH: hWorld,
+        modelScale,
+        scaleRootScale: scaleRoot.scale.x,
+      };
+    }
   });
+  if (sample && mode === 'ar') {
+    const key = `${sample.targetWorldH.toFixed(4)}@${modelScale.toFixed(3)}x${labelSizeMul.toFixed(2)}`;
+    if (key !== arLabelSizeLog.lastKey) {
+      arLabelSizeLog.lastKey = key;
+      arLabelSizeLog.samples.push(sample);
+      console.info(
+        `[labels] worldH=${sample.targetWorldH.toFixed(4)} m matrixWorld.sy=${sample.matrixWorldSy.toFixed(5)}` +
+        ` localSy=${sample.localSy.toFixed(6)} parentSy=${sample.parentSy.toFixed(3)}` +
+        ` modelScale=${sample.modelScale.toFixed(3)} mul=${labelSizeMul.toFixed(2)}`
+      );
+      globalThis.__arLabelSize = sample;
+    }
+  }
 }
 
 const sunTheta = 0.22;
@@ -1003,7 +1018,7 @@ globalThis.__measureSunPivot = () => {
   mode = 'ar';
   const sunObj = sunGroup;
   const results = [];
-  for (const s of [0.2, 1, 20]) {
+  for (const s of [0.2, 1, 20, 500, 5000]) {
     for (const ang of [0, 1.1, 2.7]) {
       modelScale = s;
       applyModelScale();
@@ -1049,17 +1064,17 @@ globalThis.__zoomDiag = () => {
  * size-attenuation-free points, including under WebXR's projection matrix.
  */
 globalThis.__measureMarkerPixels = () => {
-  // Simulate a large XR-like framebuffer and FOV-scaled Sun billboard.
   const prevMode = mode;
   const prevScale = modelScale;
   const prevSpin = spinRoot.rotation.y;
   const prevMul = markerSizeMul;
-  const prevSize = { w: renderer.domElement.width, h: renderer.domElement.height };
   const prevCam = {
     pos: camera.position.clone(),
     quat: camera.quaternion.clone(),
     aspect: camera.aspect,
     fov: camera.fov,
+    near: camera.near,
+    far: camera.far,
   };
 
   mode = 'ar';
@@ -1070,77 +1085,107 @@ globalThis.__measureMarkerPixels = () => {
   renderer.setSize(2400, 1080, false);
   camera.aspect = 2400 / 1080;
   camera.fov = 65;
+  camera.near = 0.001;
+  camera.far = 1e5;
   camera.updateProjectionMatrix();
+  markerSizeMul = 1;
+  if (markerSizeSlider) markerSizeSlider.value = '1';
+  if (markerSizeVal) markerSizeVal.textContent = '1.00×';
 
   const samples = [];
-  for (const mul of [1, 2]) {
-    for (const dist of [0.1, 1.0]) {
-      markerSizeMul = mul;
-      if (markerSizeSlider) markerSizeSlider.value = String(mul);
-      if (markerSizeVal) markerSizeVal.textContent = mul.toFixed(2) + '×';
-      modelScale = 1;
-      applyModelScale();
-      const anchor = new THREE.Vector3();
-      floorAnchor.updateWorldMatrix(true, true);
-      floorAnchor.getWorldPosition(anchor);
-      anchor.y += heightAboveFloor;
-      camera.position.set(anchor.x, anchor.y, anchor.z + dist);
-      camera.lookAt(anchor);
-      camera.updateMatrixWorld(true);
-      updateScreenMarkers();
+  const dist = 0.8;
+  for (const s of [1, 20, 100, 1000, 5000]) {
+    modelScale = s;
+    applyModelScale();
+    const anchor = new THREE.Vector3();
+    floorAnchor.updateWorldMatrix(true, true);
+    floorAnchor.getWorldPosition(anchor);
+    anchor.y += heightAboveFloor;
+    camera.position.set(anchor.x, anchor.y, anchor.z + dist);
+    camera.lookAt(anchor);
+    camera.updateMatrixWorld(true);
+    updateScreenMarkers();
 
-      const mesh = sunGroup.userData.markerMesh;
-      sunGroup.updateWorldMatrix(true, false);
-      const wp = new THREE.Vector3();
-      sunGroup.getWorldPosition(wp);
-      const camPos = new THREE.Vector3();
-      camera.getWorldPosition(camPos);
-      const d = wp.distanceTo(camPos);
-      const vFov = verticalFovRad(camera);
-      const worldH = mesh.scale.y;
-      const frac = worldH / (2 * d * Math.tan(vFov * 0.5));
-      // Project top/bottom of billboard approx via worldH along camera up
-      const halfH = worldH / 2;
-      const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
-      const top = wp.clone().addScaledVector(up, halfH).project(camera);
-      const bot = wp.clone().addScaledVector(up, -halfH).project(camera);
-      const cssH = renderer.domElement.clientHeight || 1080;
-      const coverCss = Math.abs(top.y - bot.y) * 0.5 * cssH; // NDC y span → css px
-      const coverFrac = Math.abs(top.y - bot.y) / 2; // fraction of NDC [-1,1] height
-      samples.push({
-        mul, camDist_m: dist, worldH, dist_m: d,
-        fovFrac: frac, coverNdcFrac: coverFrac,
-        coverPct: coverFrac * 100,
-        expectedPct: SUN_SCREEN_FRAC * mul * 100,
-      });
-    }
+    const mesh = sunGroup.userData.markerMesh;
+    sunGroup.updateWorldMatrix(true, false);
+    mesh.updateWorldMatrix(true, false);
+    const wp = new THREE.Vector3();
+    const scl = new THREE.Vector3();
+    sunGroup.getWorldPosition(wp);
+    mesh.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), scl);
+    const camPos = new THREE.Vector3();
+    camera.getWorldPosition(camPos);
+    const d = wp.distanceTo(camPos);
+    const vFov = verticalFovRad(camera);
+    const worldH = Math.abs(scl.y);
+    const frac = worldH / (2 * d * Math.tan(vFov * 0.5));
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+    const top = wp.clone().addScaledVector(up, worldH / 2).project(camera);
+    const bot = wp.clone().addScaledVector(up, -worldH / 2).project(camera);
+    const coverFrac = Math.abs(top.y - bot.y) / 2;
+    samples.push({
+      modelScale: s,
+      parentSy: parentWorldScaleY(mesh),
+      localSy: mesh.scale.y,
+      worldH_matrix: worldH,
+      dist_m: d,
+      fovFrac: frac,
+      coverPct: coverFrac * 100,
+      expectedPct: SUN_SCREEN_FRAC * markerSizeMul * 100,
+      sunWorld: { x: wp.x, y: wp.y, z: wp.z },
+    });
   }
 
-  // restore
+  // Slider check at scale 100 (set the DOM too — updateScreenMarkers reads it)
+  modelScale = 100;
+  applyModelScale();
+  markerSizeMul = 2;
+  if (markerSizeSlider) markerSizeSlider.value = '2';
+  if (markerSizeVal) markerSizeVal.textContent = '2.00×';
+  updateScreenMarkers();
+  {
+    const mesh = sunGroup.userData.markerMesh;
+    mesh.updateWorldMatrix(true, false);
+    const scl = new THREE.Vector3();
+    mesh.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), scl);
+    const wp = new THREE.Vector3(); sunGroup.getWorldPosition(wp);
+    const camPos = new THREE.Vector3(); camera.getWorldPosition(camPos);
+    const d = wp.distanceTo(camPos);
+    const vFov = verticalFovRad(camera);
+    const frac2 = Math.abs(scl.y) / (2 * d * Math.tan(vFov * 0.5));
+    samples.push({ modelScale: 100, markerSizeMul: markerSizeMul, coverPct: frac2 * 100, expectedPct: 5 });
+  }
+
   mode = prevMode;
   modelScale = prevScale;
   applyModelScale();
   spinRoot.rotation.y = prevSpin;
   markerSizeMul = prevMul;
   if (markerSizeSlider) markerSizeSlider.value = String(prevMul);
-  if (markerSizeVal) markerSizeVal.textContent = prevMul.toFixed(2) + '×';
+  if (markerSizeVal) markerSizeVal.textContent = Number(prevMul).toFixed(2) + '×';
   renderer.setSize(window.innerWidth, window.innerHeight, false);
   camera.position.copy(prevCam.pos);
   camera.quaternion.copy(prevCam.quat);
   camera.aspect = prevCam.aspect;
   camera.fov = prevCam.fov;
+  camera.near = prevCam.near;
+  camera.far = prevCam.far;
   camera.updateProjectionMatrix();
 
-  const at1 = samples.filter((s) => s.mul === 1);
-  const at2 = samples.filter((s) => s.mul === 2);
-  const mean1 = at1.reduce((a, s) => a + s.coverPct, 0) / at1.length;
-  const mean2 = at2.reduce((a, s) => a + s.coverPct, 0) / at2.length;
+  const base = samples.filter((s) => s.expectedPct === 2.5);
+  const maxDev = Math.max(...base.map((s) => Math.abs(s.coverPct - 2.5)));
+  const sunDrift = Math.max(...base.map((s) => Math.hypot(
+    s.sunWorld.x - base[0].sunWorld.x,
+    s.sunWorld.y - base[0].sunWorld.y,
+    s.sunWorld.z - base[0].sunWorld.z,
+  )));
   return {
     samples,
-    meanCoverPct_1x: mean1,
-    meanCoverPct_2x: mean2,
-    inRange1x: mean1 >= 2 && mean1 <= 3.5,
-    sliderDoubles: mean2 > mean1 * 1.7 && mean2 < mean1 * 2.4,
+    maxDevPct: maxDev,
+    constant25: maxDev < 0.15,
+    sunPivotDrift_m: sunDrift,
+    sunPivotOk: sunDrift < 0.001,
+    sliderAt100: samples.find((s) => s.markerSizeMul === 2) || null,
   };
 };
 
@@ -1251,10 +1296,11 @@ let touchDragging = false, touchLastX = 0, touchLastY = 0;
 let manualYaw = 0, manualPitch = -0.35;
 let camOrbitDist = 1.55; // fallback pinch zoom (camera distance)
 let modelScale = 1;      // AR pinch zoom (anchored model scale)
-const MODEL_SCALE_MIN = 0.2;
-const MODEL_SCALE_MAX = 20;
-const CAM_DIST_MIN = 0.25;
-const CAM_DIST_MAX = 8;
+const MODEL_SCALE_MIN = 0.05;
+const MODEL_SCALE_MAX = 5000; // explore Local-view siblings (tens of pc) up close
+const CAM_DIST_MIN = 0.05;
+const CAM_DIST_MAX = 12;
+const PINCH_EXP = 1.15; // slightly progressive multiplicative pinch
 const activePointers = new Map(); // id -> {x,y}
 let pinching = false;
 let pinchStartDist = 0;
@@ -1272,11 +1318,21 @@ function pointerDist(a, b) {
 }
 
 function onPinchScale(ratio) {
+  // Multiplicative from the pinch-start scale (smooth via PINCH_EXP); not additive.
+  const r = Math.max(1e-4, ratio);
   if (mode === 'ar') {
-    modelScale = THREE.MathUtils.clamp(pinchStartModelScale * ratio, MODEL_SCALE_MIN, MODEL_SCALE_MAX);
+    modelScale = THREE.MathUtils.clamp(
+      pinchStartModelScale * Math.pow(r, PINCH_EXP),
+      MODEL_SCALE_MIN,
+      MODEL_SCALE_MAX
+    );
     applyModelScale();
   } else {
-    camOrbitDist = THREE.MathUtils.clamp(pinchStartCamDist / ratio, CAM_DIST_MIN, CAM_DIST_MAX);
+    camOrbitDist = THREE.MathUtils.clamp(
+      pinchStartCamDist / Math.pow(r, PINCH_EXP),
+      CAM_DIST_MIN,
+      CAM_DIST_MAX
+    );
   }
 }
 
