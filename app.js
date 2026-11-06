@@ -23,6 +23,8 @@ const btnInfo = document.getElementById('btnInfo');
 const btnOrient = document.getElementById('btnOrient');
 const heightSlider = document.getElementById('heightSlider');
 const heightVal = document.getElementById('heightVal');
+const labelSizeSlider = document.getElementById('labelSizeSlider');
+const labelSizeVal = document.getElementById('labelSizeVal');
 const permOverlay = document.getElementById('permOverlay');
 const btnPerm = document.getElementById('btnPerm');
 const canvas = document.getElementById('c');
@@ -348,11 +350,16 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y, x + w, y, r);
   ctx.closePath();
 }
-// Labels ~40% of prior world size; animation loop re-scales for readable on-screen size.
+// Fallback labels stay at ~40% of the original world size (+ orbit compensate).
+// AR labels use a fixed real-world line height in metres (scene units = metres),
+// fully cancelling floatRoot / pinch modelScale so size stays ~1.5–2 cm.
 const LABEL_SIZE = 0.4;
-const LABEL_REF_ORBIT = 1.55; // fallback orbit distance used as screen-size reference
+const LABEL_REF_ORBIT = 1.55;
 const LABEL_COMP_MIN = 0.25;
 const LABEL_COMP_MAX = 2.2;
+const AR_LABEL_LINE_M = 0.018; // 1.8 cm plate height at labelSizeMul = 1
+let labelSizeMul = 1;
+let arLabelSizeLog = { lastKey: '', samples: [] };
 
 function makeLabel(text, color = '#ffe9a8', scale = 1) {
   const c = document.createElement('canvas');
@@ -360,7 +367,7 @@ function makeLabel(text, color = '#ffe9a8', scale = 1) {
   const pad = 10;
   ctx.font = '600 26px system-ui, sans-serif';
   const w = Math.ceil(ctx.measureText(text).width) + pad * 2;
-  const h = 40;
+  const h = 40; // one text line plate (canvas CSS px before 2× backing store)
   c.width = w * 2; c.height = h * 2;
   ctx.scale(2, 2);
   ctx.font = '600 26px system-ui, sans-serif';
@@ -371,29 +378,75 @@ function makeLabel(text, color = '#ffe9a8', scale = 1) {
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
-  const sx = (w / 520) * scale * LABEL_SIZE;
-  const sy = (h / 520) * scale * LABEL_SIZE;
-  spr.scale.set(sx, sy, 1);
+  // Fallback world size (metres at modelScale=1): previously (h/520)*scale, then ×0.4
+  const fbSx = (w / 520) * scale * LABEL_SIZE;
+  const fbSy = (h / 520) * scale * LABEL_SIZE;
+  spr.scale.set(fbSx, fbSy, 1);
   spr.userData.isLabel = true;
-  spr.userData.baseSx = sx;
-  spr.userData.baseSy = sy;
+  spr.userData.aspect = w / h;
+  spr.userData.scaleMul = scale;
+  spr.userData.fbSx = fbSx;
+  spr.userData.fbSy = fbSy;
+  spr.userData.canvasW = w;
+  spr.userData.canvasH = h;
   return spr;
 }
 
-function labelZoomCompensate() {
-  // AR: cancel floatRoot pinch scale (capped). Fallback: grow slightly with orbit distance.
-  if (mode === 'ar') {
-    return THREE.MathUtils.clamp(1 / Math.max(modelScale, 0.001), LABEL_COMP_MIN, LABEL_COMP_MAX);
-  }
-  return THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX);
-}
-
 function updateLabelSprites(root) {
-  const k = labelZoomCompensate();
+  if (mode === 'ar') {
+    // Target world height in metres, independent of pinch: local = world / modelScale
+    // because labels live under floatRoot.scale = modelScale.
+    const worldH = AR_LABEL_LINE_M * labelSizeMul;
+    const inv = 1 / Math.max(modelScale, 1e-6);
+    let sample = null;
+    root.traverse((c) => {
+      if (!c.isSprite || !c.userData.isLabel) return;
+      c.quaternion.copy(camera.quaternion);
+      // Uniform line height in AR (ignore decorative scaleMul) so every plate is ~1.8 cm
+      const hWorld = worldH;
+      const wWorld = hWorld * (c.userData.aspect || 1);
+      c.scale.set(wWorld * inv, hWorld * inv, 1);
+      if (!sample) {
+        sample = {
+          textAspect: c.userData.aspect,
+          scaleMul: c.userData.scaleMul,
+          canvasW: c.userData.canvasW,
+          canvasH: c.userData.canvasH,
+          localSx: c.scale.x,
+          localSy: c.scale.y,
+          worldW: wWorld,
+          worldH: hWorld,
+          modelScale,
+          floatRootScale: floatRoot.scale.x,
+        };
+      }
+    });
+    if (sample) {
+      const key = `${sample.worldH.toFixed(4)}@${modelScale.toFixed(3)}x${labelSizeMul.toFixed(2)}`;
+      if (key !== arLabelSizeLog.lastKey) {
+        arLabelSizeLog.lastKey = key;
+        arLabelSizeLog.samples.push(sample);
+        // eslint-disable-next-line no-console
+        console.info(
+          `[labels:AR] worldH=${sample.worldH.toFixed(4)} m (${(sample.worldH * 100).toFixed(2)} cm)` +
+          ` worldW=${sample.worldW.toFixed(4)} m` +
+          ` localSy=${sample.localSy.toFixed(5)} modelScale=${sample.modelScale.toFixed(3)}` +
+          ` labelSizeMul=${labelSizeMul.toFixed(2)}` +
+          ` (canvas ${sample.canvasW}×${sample.canvasH}, aspect ${sample.textAspect.toFixed(2)})`
+        );
+        // Expose last sample for headless checks
+        globalThis.__arLabelSize = sample;
+      }
+    }
+    return;
+  }
+
+  // Fallback: previous behaviour, with optional size multiplier from the slider
+  const k = THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX) * labelSizeMul;
   root.traverse((c) => {
     if (!c.isSprite || !c.userData.isLabel) return;
     c.quaternion.copy(camera.quaternion);
-    c.scale.set(c.userData.baseSx * k, c.userData.baseSy * k, 1);
+    c.scale.set(c.userData.fbSx * k, c.userData.fbSy * k, 1);
   });
 }
 
@@ -637,6 +690,45 @@ heightSlider.addEventListener('input', () => {
   applyHeight();
 });
 applyHeight();
+
+labelSizeSlider.addEventListener('input', () => {
+  labelSizeMul = parseFloat(labelSizeSlider.value);
+  labelSizeVal.textContent = labelSizeMul.toFixed(2) + '×';
+  arLabelSizeLog.lastKey = ''; // force re-log on next AR frame
+});
+labelSizeMul = parseFloat(labelSizeSlider.value) || 1;
+labelSizeVal.textContent = labelSizeMul.toFixed(2) + '×';
+
+/** Headless / debug: report intended AR label world size (metres). */
+globalThis.__getLabelSizing = () => {
+  const worldH = AR_LABEL_LINE_M * labelSizeMul;
+  let sample = null;
+  const inv = 1 / Math.max(modelScale, 1e-6);
+  labelsRoot.traverse((c) => {
+    if (!c.isSprite || !c.userData.isLabel || sample) return;
+    const hWorld = worldH; // uniform AR line height
+    const wWorld = hWorld * (c.userData.aspect || 1);
+    sample = {
+      AR_LABEL_LINE_M,
+      labelSizeMul,
+      modelScale,
+      mode,
+      canvasW: c.userData.canvasW,
+      canvasH: c.userData.canvasH,
+      aspect: c.userData.aspect,
+      scaleMul: c.userData.scaleMul,
+      worldH_m: hWorld,
+      worldW_m: wWorld,
+      worldH_cm: hWorld * 100,
+      localSy: hWorld * inv,
+      localSx: wWorld * inv,
+      fallbackSy_m: c.userData.fbSy
+        * THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX)
+        * labelSizeMul,
+    };
+  });
+  return sample;
+};
 
 function setViewMode(mode) {
   viewMode = mode;
