@@ -26,6 +26,7 @@ Please **do not** open a public issue for exploitable vulnerabilities.
 ## Hardening in this repo
 
 - Vendored, exact-version `three@0.170.0` (no CDN at runtime).
-- Content-Security-Policy meta tag (`script-src 'self'`, no `unsafe-eval`).
+- Strict Content-Security-Policy meta tag: `default-src 'none'`; `script-src` / `style-src 'self'` (no `unsafe-inline` / `unsafe-eval`); styles live in `style.css`.
+- Note: `frame-ancestors` is **not** enforceable via a meta CSP (browsers ignore it there); custom HTTP headers are not available on GitHub Pages for this project.
 - `Referrer-Policy: no-referrer`.
 - GitHub Actions pinned by commit SHA with minimal permissions.
