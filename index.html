@@ -12,8 +12,10 @@
       width: 100%; height: 100%; overflow: hidden; background: #000;
       font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
       color: #e8eef8; touch-action: none; -webkit-user-select: none; user-select: none;
+      -webkit-touch-callout: none; overscroll-behavior: none;
     }
     #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+    #hud, #ui, #info, #permOverlay { touch-action: none; }
     #ui {
       position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
       padding: 10px 12px calc(12px + env(safe-area-inset-bottom, 0px));
@@ -742,6 +744,36 @@ let deviceAlpha = 0, deviceBeta = 0, deviceGamma = 0;
 let orientBase = null;
 let touchDragging = false, touchLastX = 0, touchLastY = 0;
 let manualYaw = 0, manualPitch = -0.35;
+let camOrbitDist = 1.55; // fallback pinch zoom (camera distance)
+let modelScale = 1;      // AR pinch zoom (anchored model scale)
+const MODEL_SCALE_MIN = 0.2;
+const MODEL_SCALE_MAX = 20;
+const CAM_DIST_MIN = 0.25;
+const CAM_DIST_MAX = 8;
+const activePointers = new Map(); // id -> {x,y}
+let pinching = false;
+let pinchStartDist = 0;
+let pinchStartCamDist = 1.55;
+let pinchStartModelScale = 1;
+
+function applyModelScale() {
+  floatRoot.scale.setScalar(modelScale);
+}
+applyModelScale();
+
+function pointerDist(a, b) {
+  const dx = a.x - b.x, dy = a.y - b.y;
+  return Math.hypot(dx, dy);
+}
+
+function onPinchScale(ratio) {
+  if (mode === 'ar') {
+    modelScale = THREE.MathUtils.clamp(pinchStartModelScale * ratio, MODEL_SCALE_MIN, MODEL_SCALE_MAX);
+    applyModelScale();
+  } else {
+    camOrbitDist = THREE.MathUtils.clamp(pinchStartCamDist / ratio, CAM_DIST_MIN, CAM_DIST_MAX);
+  }
+}
 
 const needsOrientPermission =
   typeof DeviceOrientationEvent !== 'undefined' &&
@@ -788,12 +820,15 @@ function updateFallbackCamera() {
     _qScreen.setFromAxisAngle(_zee, -THREE.MathUtils.degToRad(orientAngle));
     _euler.set(beta, alpha, -gamma, 'YXZ');
     _q.setFromEuler(_euler); _q.multiply(_q0); _q.multiply(_qScreen);
-    const eyeLocal = new THREE.Vector3(0, 1.35 - heightAboveFloor, PLACE_DISTANCE_M);
+    const eyeDist = THREE.MathUtils.clamp(camOrbitDist, CAM_DIST_MIN, CAM_DIST_MAX);
+    const eyeLocal = new THREE.Vector3(0, 1.35 - heightAboveFloor, eyeDist);
     eyeLocal.applyQuaternion(_q);
     camera.position.copy(target).add(eyeLocal);
     camera.quaternion.copy(_q);
   } else {
-    const r = viewMode === 'local' ? 1.1 : 1.55;
+    const base = viewMode === 'local' ? 1.1 : 1.55;
+    // camOrbitDist is absolute distance; keep relative feel when switching local/galaxy by scaling base
+    const r = THREE.MathUtils.clamp(camOrbitDist * (base / 1.55), CAM_DIST_MIN, CAM_DIST_MAX);
     const yaw = manualYaw;
     const pitch = THREE.MathUtils.clamp(manualPitch, -1.2, 0.35);
     const x = Math.sin(yaw) * Math.cos(pitch) * r;
@@ -804,19 +839,89 @@ function updateFallbackCamera() {
   }
 }
 
-canvas.addEventListener('pointerdown', (e) => {
-  if (mode !== 'fallback') return;
-  touchDragging = true; touchLastX = e.clientX; touchLastY = e.clientY;
-  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+function endPointer(id) {
+  activePointers.delete(id);
+  if (activePointers.size < 2) {
+    pinching = false;
+    pinchStartDist = 0;
+  }
+  if (activePointers.size === 0) touchDragging = false;
+  else if (activePointers.size === 1) {
+    const only = activePointers.values().next().value;
+    touchDragging = mode === 'fallback';
+    touchLastX = only.x; touchLastY = only.y;
+  }
+}
+
+function onPointerDown(e) {
+  // Ignore UI controls
+  if (e.target.closest && e.target.closest('#ui, #info, #permOverlay, button, input, label, a')) return;
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  try { (e.target === canvas ? canvas : document.body).setPointerCapture?.(e.pointerId); } catch (_) {}
+
+  if (activePointers.size === 2) {
+    touchDragging = false;
+    pinching = true;
+    const pts = [...activePointers.values()];
+    pinchStartDist = Math.max(1, pointerDist(pts[0], pts[1]));
+    pinchStartCamDist = camOrbitDist;
+    pinchStartModelScale = modelScale;
+  } else if (activePointers.size === 1 && mode === 'fallback') {
+    touchDragging = true;
+    touchLastX = e.clientX; touchLastY = e.clientY;
+  }
+}
+
+function onPointerMove(e) {
+  if (!activePointers.has(e.pointerId)) return;
+  activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (pinching && activePointers.size >= 2) {
+    const pts = [...activePointers.values()];
+    const dist = Math.max(1, pointerDist(pts[0], pts[1]));
+    onPinchScale(dist / pinchStartDist);
+    return;
+  }
+
+  if (touchDragging && mode === 'fallback' && activePointers.size === 1) {
+    manualYaw -= (e.clientX - touchLastX) * 0.005;
+    manualPitch -= (e.clientY - touchLastY) * 0.004;
+    touchLastX = e.clientX; touchLastY = e.clientY;
+  }
+}
+
+function onPointerUp(e) {
+  endPointer(e.pointerId);
+}
+
+// Canvas + body (dom-overlay in AR) share the same pinch/drag handlers
+for (const el of [canvas, document.body]) {
+  el.addEventListener('pointerdown', onPointerDown);
+  el.addEventListener('pointermove', onPointerMove);
+  el.addEventListener('pointerup', onPointerUp);
+  el.addEventListener('pointercancel', onPointerUp);
+  el.addEventListener('pointerout', (e) => { if (e.pointerType !== 'mouse') endPointer(e.pointerId); });
+}
+
+// Block browser pinch-zoom / iOS gesture zoom
+['gesturestart', 'gesturechange', 'gestureend'].forEach((type) => {
+  document.addEventListener(type, (e) => e.preventDefault(), { passive: false });
 });
-canvas.addEventListener('pointermove', (e) => {
-  if (!touchDragging || mode !== 'fallback') return;
-  manualYaw -= (e.clientX - touchLastX) * 0.005;
-  manualPitch -= (e.clientY - touchLastY) * 0.004;
-  touchLastX = e.clientX; touchLastY = e.clientY;
-});
-canvas.addEventListener('pointerup', () => { touchDragging = false; });
-canvas.addEventListener('pointercancel', () => { touchDragging = false; });
+document.addEventListener('touchmove', (e) => {
+  if (e.touches && e.touches.length > 1) e.preventDefault();
+}, { passive: false });
+// Desktop wheel zoom as bonus for fallback testing
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const factor = Math.exp(-e.deltaY * 0.0015);
+  if (mode === 'ar') {
+    modelScale = THREE.MathUtils.clamp(modelScale * factor, MODEL_SCALE_MIN, MODEL_SCALE_MAX);
+    applyModelScale();
+  } else {
+    camOrbitDist = THREE.MathUtils.clamp(camOrbitDist / factor, CAM_DIST_MIN, CAM_DIST_MAX);
+  }
+}, { passive: false });
 
 let xrSession = null, hitTestSource = null, hitTestSourceRequested = false, refSpace = null;
 let placed = false, arSupported = false;
@@ -905,9 +1010,11 @@ btnAR.addEventListener('click', () => {
 btnRecenter.addEventListener('click', () => {
   if (mode === 'ar' && xrSession) {
     placed = false; floorAnchor.visible = false; reticle.visible = true;
+    modelScale = 1; applyModelScale();
     setStatus('Point at the floor, then tap', 'Height slider still applies after place.');
   } else {
     orientBase = null; manualYaw = 0; manualPitch = -0.35;
+    camOrbitDist = 1.55; modelScale = 1; applyModelScale();
     placeFallbackDefault();
     setStatus('Recentered', fallbackHint());
   }
@@ -936,8 +1043,8 @@ btnPerm.addEventListener('click', async () => {
 
 function fallbackHint() {
   if (needsOrientPermission && !orientEnabled) return 'Enable motion, drag to orbit, or open Local view for siblings.';
-  if (orientEnabled) return 'Turn the phone · height slider lifts the model off the floor.';
-  return 'Drag to orbit · Local view shows sibling stars.';
+  if (orientEnabled) return 'Turn the phone · pinch to zoom · height slider lifts the model.';
+  return 'Drag to orbit · pinch to zoom · Local view for siblings.';
 }
 
 window.addEventListener('resize', () => {
