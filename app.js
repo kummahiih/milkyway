@@ -903,7 +903,7 @@ btnPerm.addEventListener('click', async () => {
   const ok = await enableOrientation();
   permOverlay.classList.remove('show');
   if (ok) {
-    btnOrient.style.display = 'none';
+    btnOrient.classList.add('is-hidden');
     setStatus('Motion enabled', `Galaxy floats ${heightAboveFloor.toFixed(2)} m above the floor plane.`);
   } else setStatus('Motion permission denied', 'You can still drag to orbit.');
 });
@@ -967,7 +967,7 @@ placeFallbackDefault();
   arSupported = await checkAR();
   btnAR.disabled = !arSupported;
   btnAR.textContent = arSupported ? 'Start AR' : 'AR unavailable';
-  if (needsOrientPermission) btnOrient.style.display = '';
+  if (needsOrientPermission) btnOrient.classList.remove('is-hidden');
   else if (typeof DeviceOrientationEvent !== 'undefined') {
     window.addEventListener('deviceorientation', onDeviceOrientation, true);
   }

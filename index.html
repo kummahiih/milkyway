@@ -4,75 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
   <meta name="referrer" content="no-referrer" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; base-uri 'self'; object-src 'none'; frame-src 'none'; worker-src 'self' blob:; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; font-src 'self'; form-action 'self'; upgrade-insecure-requests" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self' blob:; base-uri 'none'; form-action 'none'; object-src 'none'" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="mobile-web-app-capable" content="yes" />
   <title>Milky Way AR · Solar siblings</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      width: 100%; height: 100%; overflow: hidden; background: #000;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      color: #e8eef8; touch-action: none; -webkit-user-select: none; user-select: none;
-      -webkit-touch-callout: none; overscroll-behavior: none;
-    }
-    #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-    #hud, #ui, #info, #permOverlay { touch-action: none; }
-    #ui {
-      position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
-      padding: 10px 12px calc(12px + env(safe-area-inset-bottom, 0px));
-      display: flex; flex-wrap: wrap; gap: 7px; justify-content: center; align-items: center;
-      background: linear-gradient(transparent, rgba(0,0,8,0.82)); pointer-events: none;
-    }
-    #ui button, #ui label.slider {
-      pointer-events: auto; appearance: none;
-      border: 1px solid rgba(160,190,255,0.35); background: rgba(12,18,36,0.85);
-      color: #e8eef8; border-radius: 999px; padding: 9px 13px; font-size: 13px; font-weight: 600;
-      backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
-    }
-    #ui button:active { transform: scale(0.97); }
-    #ui button:disabled { opacity: 0.45; }
-    #ui button.on { background: rgba(70,110,220,0.55); border-color: rgba(180,210,255,0.7); }
-    #ui label.slider {
-      display: flex; align-items: center; gap: 8px; padding: 7px 12px; border-radius: 999px;
-    }
-    #ui label.slider input { width: 88px; accent-color: #8ab4ff; }
-    #ui label.slider span { font-variant-numeric: tabular-nums; min-width: 3.2em; opacity: 0.9; }
-    #hud {
-      position: fixed; top: 0; left: 0; right: 0; z-index: 20;
-      padding: calc(10px + env(safe-area-inset-top, 0px)) 14px 10px;
-      background: linear-gradient(rgba(0,0,8,0.72), transparent); pointer-events: none;
-    }
-    #status { font-size: 13px; line-height: 1.35; opacity: 0.95; text-shadow: 0 1px 3px #000; max-width: 42rem; }
-    #hint { margin-top: 4px; font-size: 12px; opacity: 0.7; }
-    #info {
-      display: none; position: fixed; z-index: 30; left: 12px; right: 12px;
-      top: calc(72px + env(safe-area-inset-top, 0px));
-      max-height: min(52vh, 420px); overflow: auto;
-      background: rgba(8,12,28,0.92); border: 1px solid rgba(140,170,255,0.28);
-      border-radius: 14px; padding: 14px 16px; font-size: 12.5px; line-height: 1.45;
-      backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-      pointer-events: auto; -webkit-overflow-scrolling: touch;
-    }
-    #info.show { display: block; }
-    #info h2 { font-size: 15px; margin-bottom: 8px; font-weight: 700; }
-    #info h3 { font-size: 13px; margin: 12px 0 4px; opacity: 0.95; }
-    #info a { color: #9ec1ff; }
-    #info ul { padding-left: 1.15em; margin: 4px 0 8px; }
-    #info li { margin: 3px 0; }
-    #info .note { opacity: 0.75; font-size: 11.5px; margin-top: 8px; }
-    #permOverlay {
-      display: none; position: fixed; inset: 0; z-index: 40; background: rgba(0,0,10,0.88);
-      align-items: center; justify-content: center; flex-direction: column; gap: 14px;
-      padding: 24px; text-align: center;
-    }
-    #permOverlay.show { display: flex; }
-    #permOverlay p { max-width: 22rem; font-size: 15px; line-height: 1.45; opacity: 0.9; }
-    #permOverlay button {
-      appearance: none; border: 1px solid rgba(160,190,255,0.45); background: rgba(50,90,200,0.75);
-      color: #fff; border-radius: 999px; padding: 12px 22px; font-size: 16px; font-weight: 700;
-    }
-  </style>
+  <link rel="stylesheet" href="./style.css" />
 </head>
 <body>
   <canvas id="c"></canvas>
@@ -111,7 +47,7 @@
     <button type="button" id="btnLabels" class="on">Labels</button>
     <button type="button" id="btnLocal">Local view</button>
     <button type="button" id="btnInfo">Sources</button>
-    <button type="button" id="btnOrient" style="display:none">Enable motion</button>
+    <button type="button" id="btnOrient" class="is-hidden">Enable motion</button>
     <label class="slider" title="Height above floor">
       Height
       <input type="range" id="heightSlider" min="0" max="1.2" step="0.05" value="0.4" />
