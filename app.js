@@ -25,6 +25,8 @@ const heightSlider = document.getElementById('heightSlider');
 const heightVal = document.getElementById('heightVal');
 const labelSizeSlider = document.getElementById('labelSizeSlider');
 const labelSizeVal = document.getElementById('labelSizeVal');
+const markerSizeSlider = document.getElementById('markerSizeSlider');
+const markerSizeVal = document.getElementById('markerSizeVal');
 const permOverlay = document.getElementById('permOverlay');
 const btnPerm = document.getElementById('btnPerm');
 const canvas = document.getElementById('c');
@@ -161,11 +163,18 @@ function armRadius(arm, theta) {
 // Sun / sibling markers are constant screen-size points (see makeScreenMarker).
 const starPointMats = [];
 const screenMarkers = []; // Groups wrapping fixed-px Points (Sun, siblings)
+const trackedLabels = []; // { marker, label, dxPx, dyPx } — labels follow markers each frame
 const POINT_SIZE_MIN_PX = 0.7;
 const POINT_SIZE_MAX_PX = 12.0;
 const ZOOM_REF_ORBIT = 1.55; // matches default camOrbitDist
-const SUN_MARKER_PX = 7.5;
-const SIB_MARKER_PX = 4.5;
+const SUN_MARKER_PX = 15;   // CSS px before DPR / markerSizeMul
+const SIB_MARKER_PX = 9;
+const MARKER_SIZE_DEFAULT = 1;
+let markerSizeMul = MARKER_SIZE_DEFAULT;
+const _lblWp = new THREE.Vector3();
+const _lblNdc = new THREE.Vector3();
+const _lblScr = new THREE.Vector3();
+const _lblLocal = new THREE.Vector3();
 
 function getWorldZoomScale() {
   // AR: pinch scales scaleRoot. Fallback: closer camera ≈ larger on-screen size.
@@ -183,9 +192,44 @@ function applyZoomCompensate() {
   const pr = Math.min(renderer.getPixelRatio(), 2);
   for (const g of screenMarkers) {
     const pts = g.userData.markerPoints;
-    if (pts?.material?.uniforms?.uPixelRatio) {
-      pts.material.uniforms.uPixelRatio.value = pr;
+    if (!pts?.material?.uniforms) continue;
+    pts.material.uniforms.uPixelRatio.value = pr;
+    pts.material.uniforms.uPixelSize.value = (g.userData.basePixelSize || SUN_MARKER_PX) * markerSizeMul;
+  }
+}
+
+function trackLabel(marker, label, dxPx = 14, dyPx = -16) {
+  label.userData.followMarker = true;
+  trackedLabels.push({ marker, label, dxPx, dyPx });
+}
+
+/** Place each tracked label at its marker's world pos + a fixed screen-space offset. */
+function syncTrackedLabels() {
+  const w = renderer.domElement.clientWidth || window.innerWidth;
+  const h = renderer.domElement.clientHeight || window.innerHeight;
+  if (w < 1 || h < 1) return;
+  camera.updateMatrixWorld(true);
+  for (const t of trackedLabels) {
+    const { marker, label, dxPx, dyPx } = t;
+    if (!label.visible && label.parent && !label.parent.visible) continue;
+    marker.updateWorldMatrix(true, false);
+    marker.getWorldPosition(_lblWp);
+    _lblNdc.copy(_lblWp).project(camera);
+    if (!Number.isFinite(_lblNdc.z) || _lblNdc.z < -1 || _lblNdc.z > 1) {
+      // Behind camera / invalid — keep last pose
+      continue;
     }
+    // Screen pixels (CSS): +x right, +y down in DOM; we want up+right → +dx, -dy in DOM y
+    const sx = (_lblNdc.x * 0.5 + 0.5) * w + dxPx;
+    const sy = (-_lblNdc.y * 0.5 + 0.5) * h + dyPx;
+    _lblScr.set((sx / w) * 2 - 1, -(sy / h) * 2 + 1, _lblNdc.z);
+    _lblScr.unproject(camera);
+    // Convert world → label parent's local so hierarchy (spin/scale/pivot) stays consistent
+    if (!label.parent) continue;
+    label.parent.updateWorldMatrix(true, false);
+    _lblLocal.copy(_lblScr);
+    label.parent.worldToLocal(_lblLocal);
+    label.position.copy(_lblLocal);
   }
 }
 
@@ -549,7 +593,8 @@ const SIBLINGS = [
     status: 'Unlikely (Martínez-Barbosa+2016)',
     // ℓ=66.064°, b=+28.060°, Gaia DR3 ϖ=30.068 mas → d=33.26 pc
     xyz: [0.01191, 0.02683, 0.01565],
-    color: 0x7ec8ff,
+    color: 0x4db3ff, // distinct blue
+    coreColor: 0xd0ecff,
   },
   {
     id: 'HD 186302',
@@ -557,7 +602,8 @@ const SIBLINGS = [
     status: 'Unlikely without strong GMC (Webb+2020)',
     // ℓ=325.271°, b=−30.272°, Gaia DR3 ϖ=17.6309 mas → d=56.72 pc
     xyz: [0.04026, -0.02791, -0.02859],
-    color: 0xffb86b,
+    color: 0xff7a3d, // distinct orange
+    coreColor: 0xffd0b0,
   },
   {
     id: 'Solar Sibling 1',
@@ -566,7 +612,8 @@ const SIBLINGS = [
     // ℓ=80.6299°, b=12.9926°, Gaia DR3 ϖ=3.7853 mas → d=264.2 pc (Webb+2020 used ~0.36 kpc / DR2)
     // source_id 2128840912955018368
     xyz: [0.0419, 0.2540, 0.0594],
-    color: 0xffe566,
+    color: 0xb388ff, // distinct violet (not Sun yellow)
+    coreColor: 0xe8d6ff,
   },
 ];
 
@@ -582,35 +629,38 @@ function makeMarker(color, radius = 0.006) {
 
 /**
  * Constant screen-size marker (Sun / siblings).
- * gl_PointSize is fixed in CSS pixels × devicePixelRatio — independent of
- * modelScale, distance, and WebXR projection. No world-space halo.
+ * Bright core + soft ring in the fragment shader; gl_PointSize = basePx × mul × DPR.
  */
-function makeScreenMarker(color, pixelSize) {
+function makeScreenMarker(color, pixelSize, { coreColor = 0xffffff } = {}) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3));
   const mat = new THREE.ShaderMaterial({
     uniforms: {
-      pointTexture: { value: starTex },
       uColor: { value: new THREE.Color(color) },
-      uPixelSize: { value: pixelSize },
+      uCoreColor: { value: new THREE.Color(coreColor) },
+      uPixelSize: { value: pixelSize * markerSizeMul },
       uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 2) },
     },
     vertexShader: `
       uniform float uPixelSize;
       uniform float uPixelRatio;
       void main() {
-        // Constant framebuffer pixels — no distance / modelScale term
         vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-        gl_PointSize = uPixelSize * uPixelRatio;
+        gl_PointSize = max(2.0, uPixelSize * uPixelRatio);
         gl_Position = projectionMatrix * mvPosition;
       }`,
     fragmentShader: `
-      uniform sampler2D pointTexture;
       uniform vec3 uColor;
+      uniform vec3 uCoreColor;
       void main() {
-        vec4 tex = texture2D(pointTexture, gl_PointCoord);
-        if (tex.a < 0.05) discard;
-        gl_FragColor = vec4(uColor, tex.a);
+        vec2 uv = gl_PointCoord - vec2(0.5);
+        float r = length(uv) * 2.0; // 0 centre → 1 rim
+        float core = smoothstep(0.42, 0.0, r);
+        float ring = smoothstep(0.22, 0.52, r) * smoothstep(1.0, 0.62, r);
+        float a = max(core, ring * 0.9);
+        if (a < 0.03) discard;
+        vec3 col = mix(uColor, uCoreColor, core);
+        gl_FragColor = vec4(col, a);
       }`,
     transparent: true,
     depthWrite: false,
@@ -623,6 +673,7 @@ function makeScreenMarker(color, pixelSize) {
   const g = new THREE.Group();
   g.add(pts);
   g.userData.isScreenMarker = true;
+  g.userData.basePixelSize = pixelSize;
   g.userData.pixelSize = pixelSize;
   g.userData.markerPoints = pts;
   screenMarkers.push(g);
@@ -637,19 +688,19 @@ function screenMarkerFbPx(g) {
   return u.uPixelSize.value * u.uPixelRatio.value;
 }
 
-// Sun in galaxy view — fixed ~7.5 CSS px (× DPR)
-const sunGroup = makeScreenMarker(0xffe566, SUN_MARKER_PX);
+// Sun in galaxy view — ~15 CSS px × mul × DPR, bright core + soft ring
+const sunGroup = makeScreenMarker(0xffe566, SUN_MARKER_PX, { coreColor: 0xfff6c8 });
 sunGroup.position.copy(sunPos);
 galaxyRoot.add(sunGroup);
 const sunLabel = makeLabel('Sun · Orion Spur · 8.2 kpc', '#ffe9a8');
-sunLabel.position.copy(sunPos).add(new THREE.Vector3(0, 0.04, 0));
 labelsRoot.add(sunLabel);
+trackLabel(sunGroup, sunLabel, 16, -18);
 
 const centreMarker = makeMarker(0xff8866, 0.009);
 galaxyRoot.add(centreMarker);
 const centreLabel = makeLabel('Galactic centre', '#ffb0a0');
-centreLabel.position.set(0, 0.045, 0);
 labelsRoot.add(centreLabel);
+trackLabel(centreMarker, centreLabel, 14, -16);
 
 // Birth radius marker (~5 kpc on solar azimuth)
 const birthPos = cylToWorld(BIRTH_R_KPC, sunTheta, 0.02);
@@ -657,8 +708,8 @@ const birthMarker = makeMarker(0xa0ffc8, 0.007);
 birthMarker.position.copy(birthPos);
 galaxyRoot.add(birthMarker);
 const birthLabel = makeLabel('Sun birth ~5 kpc (lit. ~4.5–7)', '#b8ffd0');
-birthLabel.position.copy(birthPos).add(new THREE.Vector3(0, 0.035, 0));
 labelsRoot.add(birthLabel);
+trackLabel(birthMarker, birthLabel, 14, -16);
 // Path Sun → birth (migration)
 {
   const curve = new THREE.BufferGeometry().setFromPoints([birthPos, sunPos]);
@@ -689,12 +740,12 @@ labelsRoot.add(birthLabel);
 // Galaxy-view sibling markers (tiny at disc scale — still placed truthfully)
 for (const sib of SIBLINGS) {
   const p = helioToWorld(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-  const m = makeScreenMarker(sib.color, SIB_MARKER_PX);
+  const m = makeScreenMarker(sib.color, SIB_MARKER_PX, { coreColor: sib.coreColor });
   m.position.copy(p);
   galaxyRoot.add(m);
   const lab = makeLabel(sib.id, '#d0e8ff', 0.75);
-  lab.position.copy(p).add(new THREE.Vector3(0, 0.02, 0));
   labelsRoot.add(lab);
+  trackLabel(m, lab, 12, -14);
 }
 
 for (const L of [
@@ -763,11 +814,11 @@ function buildLocalView() {
   localRoot.add(pts);
 
   // Local Sun at origin of localRoot (we place localRoot at sun galactocentric later)
-  const localSun = makeScreenMarker(0xffe566, SUN_MARKER_PX);
+  const localSun = makeScreenMarker(0xffe566, SUN_MARKER_PX, { coreColor: 0xfff6c8 });
   localRoot.add(localSun);
   const ls = makeLabel('Sun', '#ffe9a8', 1.2);
-  ls.position.set(0, 0.08, 0);
   localLabels.add(ls);
+  trackLabel(localSun, ls, 14, -16);
 
   // 100 pc scale bar
   const barLen = 0.1 * LOCAL_M_PER_KPC;
@@ -782,21 +833,20 @@ function buildLocalView() {
 
   for (const sib of SIBLINGS) {
     const p = helioToLocal(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-    const m = makeScreenMarker(sib.color, SIB_MARKER_PX);
+    const m = makeScreenMarker(sib.color, SIB_MARKER_PX, { coreColor: sib.coreColor });
     m.position.copy(p);
     localRoot.add(m);
-    // connector to Sun
     const line = new THREE.Line(
       new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), p]),
       new THREE.LineBasicMaterial({ color: sib.color, transparent: true, opacity: 0.35 })
     );
     localRoot.add(line);
     const lab = makeLabel(`${sib.id}`, '#e8f0ff', 1.0);
-    lab.position.copy(p).add(new THREE.Vector3(0, 0.06, 0));
     localLabels.add(lab);
+    trackLabel(m, lab, 12, -14);
     const lab2 = makeLabel(sib.note, '#a8b8d0', 0.75);
-    lab2.position.copy(p).add(new THREE.Vector3(0, 0.035, 0));
     localLabels.add(lab2);
+    trackLabel(m, lab2, 12, 2); // note sits slightly below the id label
   }
 }
 buildLocalView();
@@ -822,6 +872,15 @@ labelSizeSlider.addEventListener('input', () => {
 });
 labelSizeMul = parseFloat(labelSizeSlider.value) || LABEL_SIZE_DEFAULT;
 labelSizeVal.textContent = labelSizeMul.toFixed(2) + '×';
+
+markerSizeSlider.addEventListener('input', () => {
+  markerSizeMul = parseFloat(markerSizeSlider.value);
+  markerSizeVal.textContent = markerSizeMul.toFixed(2) + '×';
+  applyZoomCompensate();
+});
+markerSizeMul = parseFloat(markerSizeSlider.value) || MARKER_SIZE_DEFAULT;
+markerSizeVal.textContent = markerSizeMul.toFixed(2) + '×';
+// applyZoomCompensate runs from the animation loop once mode/modelScale exist
 
 /** Headless / debug: apply AR label layout and measure matrixWorld height. */
 globalThis.__measureArLabelWorld = (mul = 1, scale = 1) => {
@@ -902,6 +961,8 @@ globalThis.__zoomDiag = () => {
     matCount: starPointMats.length,
     uWorldScale: starPointMats[0]?.uniforms?.uWorldScale?.value ?? null,
     sunFbPx: screenMarkerFbPx(sunGroup),
+    markerSizeMul,
+    trackedLabels: trackedLabels.length,
     modelScale,
     camOrbitDist,
     mode,
@@ -980,11 +1041,72 @@ globalThis.__measureMarkerPixels = () => {
   return {
     sunCssPx: SUN_MARKER_PX,
     sibCssPx: SIB_MARKER_PX,
+    markerSizeMul,
     samples,
     minFbPx: minS,
     maxFbPx: maxS,
     constant: Math.abs(maxS - minS) < 1e-6,
   };
+};
+
+/** Screen-space px distance between Sun marker and its label across modelScales. */
+globalThis.__measureLabelFollow = () => {
+  const prevMode = mode;
+  const prevScale = modelScale;
+  const prevSpin = spinRoot.rotation.y;
+  mode = 'ar';
+  placeFallbackDefault();
+  floorAnchor.visible = true;
+  applyPivot();
+  const samples = [];
+  for (const s of [1, 5, 20]) {
+    for (const ang of [0, 1.2]) {
+      modelScale = s;
+      applyModelScale();
+      spinRoot.rotation.y = ang;
+      // Camera looking at anchored Sun
+      const anchor = new THREE.Vector3();
+      floorAnchor.updateWorldMatrix(true, true);
+      floorAnchor.getWorldPosition(anchor);
+      anchor.y += heightAboveFloor;
+      camera.position.set(anchor.x, anchor.y + 0.15, anchor.z + 0.8);
+      camera.lookAt(anchor);
+      camera.updateMatrixWorld(true);
+      applyZoomCompensate();
+      syncTrackedLabels();
+      updateLabelSprites(labelsRoot);
+
+      sunGroup.updateWorldMatrix(true, false);
+      sunLabel.updateWorldMatrix(true, false);
+      const mp = new THREE.Vector3(); const lp = new THREE.Vector3();
+      sunGroup.getWorldPosition(mp);
+      sunLabel.getWorldPosition(lp);
+      const mN = mp.clone().project(camera);
+      const lN = lp.clone().project(camera);
+      const w = renderer.domElement.clientWidth;
+      const h = renderer.domElement.clientHeight;
+      const mSx = (mN.x * 0.5 + 0.5) * w;
+      const mSy = (-mN.y * 0.5 + 0.5) * h;
+      const lSx = (lN.x * 0.5 + 0.5) * w;
+      const lSy = (-lN.y * 0.5 + 0.5) * h;
+      const dx = lSx - mSx;
+      const dy = lSy - mSy;
+      samples.push({
+        modelScale: s, spin: ang,
+        screenDistPx: Math.hypot(dx, dy),
+        dx, dy,
+        worldDist: mp.distanceTo(lp),
+      });
+    }
+  }
+  mode = prevMode;
+  modelScale = prevScale;
+  applyModelScale();
+  spinRoot.rotation.y = prevSpin;
+  const dists = samples.map((x) => x.screenDistPx);
+  const mean = dists.reduce((a, b) => a + b, 0) / dists.length;
+  const maxDev = Math.max(...dists.map((d) => Math.abs(d - mean)));
+  return { samples, meanScreenDistPx: mean, maxDevPx: maxDev, constant: maxDev < 1.5 };
 };
 
 
@@ -1357,6 +1479,7 @@ renderer.setAnimationLoop((time, frame) => {
   spinRoot.rotation.y = t * 0.012; // slow spin around current pivot
   if (bulgeSpr) bulgeSpr.material.opacity = 0.45 + 0.12 * Math.sin(t * 0.7);
   applyZoomCompensate();
+  syncTrackedLabels();
 
   const labelParents = [];
   if (labelsVisible && galaxyRoot.visible) labelParents.push(labelsRoot);
