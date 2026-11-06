@@ -157,22 +157,56 @@ function armRadius(arm, theta) {
   return arm.a0 * Math.exp(b * (theta - arm.phase));
 }
 
+// Star / marker zoom compensation (AR modelScale + fallback cam distance)
+const starPointMats = [];
+const zoomMarkers = []; // Sun + sibling (and other) mesh markers
+const POINT_SIZE_MIN_PX = 0.7;
+const POINT_SIZE_MAX_PX = 12.0;
+const MARKER_SCALE_MIN = 0.06;
+const MARKER_SCALE_MAX = 1.6;
+const ZOOM_REF_ORBIT = 1.55; // matches default camOrbitDist
+
+function getWorldZoomScale() {
+  // AR: pinch scales scaleRoot. Fallback: closer camera ≈ larger on-screen size.
+  // Only call after mode / modelScale / camOrbitDist are initialized.
+  if (mode === 'ar') return Math.max(modelScale, 0.05);
+  return Math.max(ZOOM_REF_ORBIT / Math.max(camOrbitDist, 0.05), 0.05);
+}
+
+function applyZoomCompensate() {
+  const z = getWorldZoomScale();
+  for (const mat of starPointMats) {
+    if (mat.uniforms.uWorldScale) mat.uniforms.uWorldScale.value = z;
+  }
+  // Markers shrink when zooming in (user request); clamp so they neither vanish nor blob when zoomed out
+  const ms = THREE.MathUtils.clamp(1 / z, MARKER_SCALE_MIN, MARKER_SCALE_MAX);
+  for (const m of zoomMarkers) m.scale.setScalar(ms);
+}
+
 function makePoints(positions, colors, sizes, opacity = 0.95) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
   geo.setAttribute('aSize', new THREE.Float32BufferAttribute(sizes, 1));
   const mat = new THREE.ShaderMaterial({
-    uniforms: { pointTexture: { value: starTex }, uOpacity: { value: opacity } },
+    uniforms: {
+      pointTexture: { value: starTex },
+      uOpacity: { value: opacity },
+      uWorldScale: { value: 1 },
+      uSizeMin: { value: POINT_SIZE_MIN_PX },
+      uSizeMax: { value: POINT_SIZE_MAX_PX },
+    },
     vertexShader: `
       attribute float aSize; attribute vec3 color;
+      uniform float uWorldScale; uniform float uSizeMin; uniform float uSizeMax;
       varying vec3 vColor; varying float vAlpha;
       void main() {
         vColor = color;
         vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
         float dist = max(0.04, -mvPosition.z);
-        gl_PointSize = clamp(aSize * (320.0 / dist), 0.8, 64.0);
-        vAlpha = smoothstep(64.0, 6.0, gl_PointSize);
+        float z = max(uWorldScale, 0.05);
+        gl_PointSize = clamp(aSize * (320.0 / dist) / z, uSizeMin, uSizeMax);
+        vAlpha = smoothstep(uSizeMax, 4.0, gl_PointSize);
         gl_Position = projectionMatrix * mvPosition;
       }`,
     fragmentShader: `
@@ -185,6 +219,7 @@ function makePoints(positions, colors, sizes, opacity = 0.95) {
       }`,
     transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
   });
+  starPointMats.push(mat);
   const pts = new THREE.Points(geo, mat);
   pts.frustumCulled = false;
   return pts;
@@ -529,7 +564,7 @@ const SIBLINGS = [
   },
 ];
 
-function makeMarker(color, radius = 0.006) {
+function makeMarker(color, radius = 0.006, { zoomCompensate = false } = {}) {
   const g = new THREE.Group();
   g.add(new THREE.Mesh(
     new THREE.SphereGeometry(radius, 14, 14),
@@ -539,11 +574,12 @@ function makeMarker(color, radius = 0.006) {
     new THREE.SphereGeometry(radius * 2.2, 14, 14),
     new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.28, depthWrite: false })
   ));
+  if (zoomCompensate) zoomMarkers.push(g);
   return g;
 }
 
 // Sun in galaxy view
-const sunGroup = makeMarker(0xffe566, 0.008);
+const sunGroup = makeMarker(0xffe566, 0.008, { zoomCompensate: true });
 sunGroup.position.copy(sunPos);
 galaxyRoot.add(sunGroup);
 const sunLabel = makeLabel('Sun · Orion Spur · 8.2 kpc', '#ffe9a8');
@@ -594,7 +630,7 @@ labelsRoot.add(birthLabel);
 // Galaxy-view sibling markers (tiny at disc scale — still placed truthfully)
 for (const sib of SIBLINGS) {
   const p = helioToWorld(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-  const m = makeMarker(sib.color, 0.004);
+  const m = makeMarker(sib.color, 0.004, { zoomCompensate: true });
   m.position.copy(p);
   galaxyRoot.add(m);
   const lab = makeLabel(sib.id, '#d0e8ff', 0.75);
@@ -635,13 +671,22 @@ function buildLocalView() {
   geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
   geo.setAttribute('aSize', new THREE.Float32BufferAttribute(siz, 1));
   const mat = new THREE.ShaderMaterial({
-    uniforms: { pointTexture: { value: starTex }, uOpacity: { value: 0.9 } },
+    uniforms: {
+      pointTexture: { value: starTex },
+      uOpacity: { value: 0.9 },
+      uWorldScale: { value: 1 },
+      uSizeMin: { value: POINT_SIZE_MIN_PX },
+      uSizeMax: { value: POINT_SIZE_MAX_PX },
+    },
     vertexShader: `
-      attribute float aSize; attribute vec3 color; varying vec3 vColor;
+      attribute float aSize; attribute vec3 color;
+      uniform float uWorldScale; uniform float uSizeMin; uniform float uSizeMax;
+      varying vec3 vColor;
       void main() {
         vColor = color;
         vec4 mv = modelViewMatrix * vec4(position,1.0);
-        gl_PointSize = clamp(aSize * (260.0 / max(0.05,-mv.z)), 1.0, 40.0);
+        float z = max(uWorldScale, 0.05);
+        gl_PointSize = clamp(aSize * (260.0 / max(0.05,-mv.z)) / z, uSizeMin, uSizeMax);
         gl_Position = projectionMatrix * mv;
       }`,
     fragmentShader: `
@@ -653,12 +698,13 @@ function buildLocalView() {
       }`,
     transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
   });
+  starPointMats.push(mat);
   const pts = new THREE.Points(geo, mat);
   pts.frustumCulled = false;
   localRoot.add(pts);
 
   // Local Sun at origin of localRoot (we place localRoot at sun galactocentric later)
-  const localSun = makeMarker(0xffe566, 0.025);
+  const localSun = makeMarker(0xffe566, 0.025, { zoomCompensate: true });
   localRoot.add(localSun);
   const ls = makeLabel('Sun', '#ffe9a8', 1.2);
   ls.position.set(0, 0.08, 0);
@@ -677,7 +723,7 @@ function buildLocalView() {
 
   for (const sib of SIBLINGS) {
     const p = helioToLocal(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-    const m = makeMarker(sib.color, 0.018);
+    const m = makeMarker(sib.color, 0.018, { zoomCompensate: true });
     m.position.copy(p);
     localRoot.add(m);
     // connector to Sun
@@ -789,6 +835,20 @@ globalThis.__measureSunPivot = () => {
 };
 
 globalThis.__getLabelSizing = () => globalThis.__measureArLabelWorld(labelSizeMul, modelScale);
+globalThis.__zoomDiag = () => {
+  applyZoomCompensate();
+  return {
+    worldZoom: getWorldZoomScale(),
+    markerCount: zoomMarkers.length,
+    matCount: starPointMats.length,
+    uWorldScale: starPointMats[0]?.uniforms?.uWorldScale?.value ?? null,
+    markerScale: zoomMarkers[0]?.scale?.x ?? null,
+    modelScale,
+    camOrbitDist,
+    mode,
+  };
+};
+
 
 function setViewMode(mode) {
   viewMode = mode;
@@ -1158,6 +1218,7 @@ renderer.setAnimationLoop((time, frame) => {
   const t = clock.getElapsedTime();
   spinRoot.rotation.y = t * 0.012; // slow spin around current pivot
   if (bulgeSpr) bulgeSpr.material.opacity = 0.45 + 0.12 * Math.sin(t * 0.7);
+  applyZoomCompensate();
 
   const labelParents = [];
   if (labelsVisible && galaxyRoot.visible) labelParents.push(labelsRoot);
