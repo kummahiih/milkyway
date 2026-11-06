@@ -4,9 +4,11 @@ A mobile web page that shows a procedural 3D Milky Way with the Sun marked in th
 
 ## Live page
 
-GitHub Pages: https://kummahiih.github.io/milkyway/
+- **GitHub Pages (preferred):** https://kummahiih.github.io/milkyway/  
+  If that 404s, open **Settings → Pages** on this repo, set Source to **GitHub Actions**, then re-run the “Deploy GitHub Pages” workflow (or push any commit).
+- **CDN mirror (works immediately):** https://cdn.jsdelivr.net/gh/kummahiih/milkyway@main/index.html
 
-Open that URL on your phone.
+Open either URL on your phone (HTTPS required for motion / AR).
 
 ## How to use
 
@@ -24,20 +26,16 @@ Open that URL on your phone.
 
 ## Run locally
 
-Serve the folder over HTTPS (required for DeviceOrientation permission and WebXR):
-
 ```bash
 python3 -m http.server 8765
-# then expose with any HTTPS tunnel, or open via GitHub Pages
 ```
 
-Single file: `index.html` (three.js via CDN import map).
+Serve over HTTPS for DeviceOrientation permission and WebXR (e.g. GitHub Pages or any HTTPS reverse proxy). Single file: `index.html` (three.js via CDN import map).
 
 ## Limitations
 
 - Full 6DOF world-locked AR needs WebXR `immersive-ar` + hit-test (typically Chrome on Android with ARCore). iOS Safari has no WebXR AR; the fallback only tracks rotation, not walking.
 - The galaxy is a stylised particle approximation, not a survey catalogue.
-- Quick tunnels (cloudflared, etc.) may be blocked in some networks; GitHub Pages is the stable public host.
 - Performance depends on the phone GPU (~80k particles).
 
 ## License
