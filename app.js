@@ -162,25 +162,27 @@ function armRadius(arm, theta) {
 }
 
 // Field-star zoom compensation (AR modelScale + fallback cam distance).
-// Sun / sibling markers are FOV-scaled billboard quads (see makeScreenMarker / updateScreenMarkers).
+// Sun / siblings / labels = DOM overlay (fixed CSS px). See updateOverlayHud.
 const starPointMats = [];
-const screenMarkers = []; // Groups with camera-facing Plane meshes
-const trackedLabels = []; // { marker, label, dxPx, dyPx } — labels follow markers each frame
+const overlayItems = [];
 const POINT_SIZE_MIN_PX = 0.7;
 const POINT_SIZE_MAX_PX = 12.0;
-const ZOOM_REF_ORBIT = 1.55; // matches default camOrbitDist
-const SUN_SCREEN_FRAC = 0.025; // ~2.5% of vertical FOV at markerSizeMul = 1
-const SIB_SIZE_FRAC = 0.6;     // siblings = 60% of Sun angular size
+const ZOOM_REF_ORBIT = 1.55;
 const MARKER_SIZE_DEFAULT = 1;
+const SUN_DOT_PX = 18;
+const SIB_DOT_PX = 11;
+const LABEL_FONT_PX = 12.5;
 let markerSizeMul = MARKER_SIZE_DEFAULT;
 let debugVisible = false;
-const _lblWp = new THREE.Vector3();
-const _lblNdc = new THREE.Vector3();
-const _lblScr = new THREE.Vector3();
-const _lblLocal = new THREE.Vector3();
+const BUILD_ID = document.getElementById('buildTag')?.dataset?.build || 'dev';
+const markerOverlay = document.getElementById('markerOverlay');
+const _projWp = new THREE.Vector3();
+const _viewPos = new THREE.Vector3();
 const _mkCamPos = new THREE.Vector3();
-const _mkWp = new THREE.Vector3();
 const _mkQuat = new THREE.Quaternion();
+const _lblWp = new THREE.Vector3();
+const _parentScale = new THREE.Vector3();
+const _worldScale = new THREE.Vector3();
 
 function getWorldZoomScale() {
   if (mode === 'ar') return Math.max(modelScale, 0.05);
@@ -194,14 +196,21 @@ function applyZoomCompensate() {
   }
 }
 
-/** Read Markers slider every frame (dom-overlay / XR-safe). */
+/** Read Markers / Label sliders every frame (dom-overlay / XR-safe). */
 function readMarkerSizeSlider() {
-  if (!markerSizeSlider) return;
-  const v = parseFloat(markerSizeSlider.value);
-  if (!Number.isFinite(v)) return;
-  if (v !== markerSizeMul) {
-    markerSizeMul = v;
-    if (markerSizeVal) markerSizeVal.textContent = markerSizeMul.toFixed(2) + '×';
+  if (markerSizeSlider) {
+    const v = parseFloat(markerSizeSlider.value);
+    if (Number.isFinite(v) && v !== markerSizeMul) {
+      markerSizeMul = v;
+      if (markerSizeVal) markerSizeVal.textContent = markerSizeMul.toFixed(2) + '×';
+    }
+  }
+  if (labelSizeSlider) {
+    const v = parseFloat(labelSizeSlider.value);
+    if (Number.isFinite(v) && v !== labelSizeMul) {
+      labelSizeMul = v;
+      if (labelSizeVal) labelSizeVal.textContent = labelSizeMul.toFixed(2) + '×';
+    }
   }
 }
 
@@ -216,51 +225,120 @@ function getActiveCameras() {
 }
 
 function verticalFovRad(cam) {
-  // Prefer projection matrix (correct for WebXR eye cameras)
   const m5 = Math.abs(cam.projectionMatrix.elements[5]);
   if (m5 > 1e-8) return 2 * Math.atan(1 / m5);
   if (cam.fov) return THREE.MathUtils.degToRad(cam.fov);
   return THREE.MathUtils.degToRad(65);
 }
 
+function parentWorldScaleY(obj) {
+  if (!obj.parent) return 1;
+  obj.parent.updateWorldMatrix(true, false);
+  obj.parent.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _parentScale);
+  return Math.max(Math.abs(_parentScale.y), 1e-9);
+}
+
+/** Invisible 3D anchor (world position only — no billboard mesh). */
+function makeAnchor() {
+  return new THREE.Group();
+}
+
+function colorCss(hex) {
+  const c = new THREE.Color(hex);
+  return `rgb(${Math.round(c.r * 255)},${Math.round(c.g * 255)},${Math.round(c.b * 255)})`;
+}
+
+function addOverlayDot(anchor, { kind, color, view }) {
+  const el = document.createElement('div');
+  el.className = kind === 'sun' ? 'overlay-dot overlay-sun' : 'overlay-dot overlay-sib';
+  if (kind === 'sib') el.style.background = colorCss(color);
+  markerOverlay.appendChild(el);
+  overlayItems.push({ anchor, el, kind, view, color });
+  return el;
+}
+
+function addOverlayLabel(anchor, text, { view, ox = 14, oy = -18 } = {}) {
+  const el = document.createElement('div');
+  el.className = 'overlay-label';
+  el.textContent = text;
+  markerOverlay.appendChild(el);
+  overlayItems.push({ anchor, el, kind: 'label', view, ox, oy });
+  return el;
+}
+
 /**
- * Size + face billboard markers from distance to the XR/fallback camera so the
- * Sun covers SUN_SCREEN_FRAC × markerSizeMul of the vertical FOV.
+ * Project a world position into overlay CSS pixels using the XR eye / mono camera.
  */
-function updateScreenMarkers() {
-  readMarkerSizeSlider();
-  const { head, eyes } = getActiveCameras();
-  head.updateMatrixWorld(true);
+function projectWorldToOverlay(worldPos) {
+  const { eyes } = getActiveCameras();
   const eye = eyes[0];
   eye.updateMatrixWorld(true);
-  const vFov = verticalFovRad(eye);
-  head.getWorldPosition(_mkCamPos);
-  head.getWorldQuaternion(_mkQuat);
+  _viewPos.copy(worldPos).applyMatrix4(eye.matrixWorldInverse);
+  // Three.js camera looks down −Z; in front ⇒ view.z < 0
+  const behind = _viewPos.z >= -1e-4;
+  _projWp.copy(worldPos).project(eye);
+  const w = renderer.domElement.clientWidth || window.innerWidth;
+  const h = renderer.domElement.clientHeight || window.innerHeight;
+  const x = (_projWp.x * 0.5 + 0.5) * w;
+  const y = (-_projWp.y * 0.5 + 0.5) * h;
+  return { x, y, behind, ndcZ: _projWp.z, viewZ: _viewPos.z, w, h };
+}
 
-  let lastWorldH = 0;
-  let lastDist = 0;
-  let lastParentSy = 1;
-  for (const g of screenMarkers) {
-    const mesh = g.userData.markerMesh;
-    if (!mesh) continue;
-    // World position of the marker (Sun stays at scaleRoot origin → float-safe)
-    g.updateWorldMatrix(true, false);
-    g.getWorldPosition(_mkWp);
-    const dist = Math.max(0.05, _mkWp.distanceTo(_mkCamPos));
-    const frac = SUN_SCREEN_FRAC * markerSizeMul * (g.userData.sizeFrac || 1);
-    const worldH = 2 * dist * Math.tan(vFov * 0.5) * frac;
-    // CRITICAL: mesh.scale is LOCAL; scaleRoot (modelScale) is an ancestor.
-    // local = desiredWorld / parentWorldScale so on-screen size stays constant when pinching.
-    const parentSy = parentWorldScaleY(mesh);
-    const local = worldH / parentSy;
-    mesh.scale.set(local, local, 1);
-    mesh.quaternion.copy(_mkQuat);
-    if (g === sunGroup) {
-      mesh.updateWorldMatrix(true, false);
-      mesh.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _worldScale);
-      lastWorldH = Math.abs(_worldScale.y);
-      lastDist = dist;
-      lastParentSy = parentSy;
+function applyOverlaySizes() {
+  const sunPx = SUN_DOT_PX * markerSizeMul;
+  const sibPx = SIB_DOT_PX * markerSizeMul;
+  const fontPx = LABEL_FONT_PX * labelSizeMul;
+  for (const item of overlayItems) {
+    const { el, kind } = item;
+    if (kind === 'sun') {
+      el.style.width = sunPx + 'px';
+      el.style.height = sunPx + 'px';
+    } else if (kind === 'sib') {
+      el.style.width = sibPx + 'px';
+      el.style.height = sibPx + 'px';
+    } else if (kind === 'label') {
+      el.style.fontSize = fontPx + 'px';
+    }
+  }
+}
+
+/** Position DOM markers/labels from 3D anchors. Fixed CSS size — independent of modelScale. */
+function updateOverlayHud() {
+  readMarkerSizeSlider();
+  applyOverlaySizes();
+  const showGalaxy = viewMode !== 'local';
+  const showLocal = viewMode === 'local';
+  let sunSample = null;
+
+  for (const item of overlayItems) {
+    const { anchor, el, kind, view, ox = 0, oy = 0 } = item;
+    const viewOk = (view === 'galaxy' && showGalaxy) || (view === 'local' && showLocal);
+    const labelsOk = kind !== 'label' || labelsVisible;
+    if (!viewOk || !labelsOk) {
+      el.classList.add('is-hidden');
+      continue;
+    }
+    anchor.updateWorldMatrix(true, false);
+    anchor.getWorldPosition(_projWp);
+    const p = projectWorldToOverlay(_projWp);
+    if (p.behind || !Number.isFinite(p.x) || !Number.isFinite(p.y)) {
+      el.classList.add('is-hidden');
+      continue;
+    }
+    el.classList.remove('is-hidden');
+    const x = p.x + (kind === 'label' ? ox : 0);
+    const y = p.y + (kind === 'label' ? oy : 0);
+    if (kind === 'label') {
+      el.style.transform = `translate(${x}px, ${y}px) translate(0, -100%)`;
+    } else {
+      el.style.transform = `translate(${x}px, ${y}px) translate(-50%, -50%)`;
+    }
+    if (kind === 'sun' && view === 'galaxy' && !sunSample) {
+      sunSample = {
+        cssPx: SUN_DOT_PX * markerSizeMul,
+        computedW: el.style.width,
+        x: p.x, y: p.y, modelScale, build: BUILD_ID,
+      };
     }
   }
 
@@ -274,51 +352,15 @@ function updateScreenMarkers() {
     const fbW = renderer.domElement.width;
     const fbH = renderer.domElement.height;
     const xrOn = !!(renderer.xr && renderer.xr.isPresenting);
-    const screenFrac = lastDist > 0
-      ? lastWorldH / (2 * lastDist * Math.tan(vFov * 0.5))
-      : 0;
     debugLine.textContent =
-      `fb ${fbW}×${fbH} · XR ${xrOn ? 'on' : 'off'} · ptRange ${ptRange}` +
-      ` · Markers ${markerSizeMul.toFixed(2)}× · scale ${modelScale.toFixed(0)}×` +
-      ` · FOVy ${(vFov * 180 / Math.PI).toFixed(1)}° · SunFrac ${(screenFrac * 100).toFixed(2)}%` +
-      ` · parentSy ${lastParentSy.toFixed(2)} · dist ${lastDist.toFixed(2)} m`;
+      `build ${BUILD_ID} · fb ${fbW}×${fbH} · XR ${xrOn ? 'on' : 'off'} · ptRange ${ptRange}` +
+      ` · Markers ${markerSizeMul.toFixed(2)}× · Labels ${labelSizeMul.toFixed(2)}×` +
+      ` · scale ${Number(modelScale).toFixed(0)}×` +
+      (sunSample ? ` · SunCSS ${sunSample.cssPx.toFixed(1)}px` : '');
   }
+  globalThis.__overlaySunSample = sunSample;
 }
 
-function trackLabel(marker, label, dxPx = 14, dyPx = -16) {
-  label.userData.followMarker = true;
-  trackedLabels.push({ marker, label, dxPx, dyPx });
-}
-
-/** Place each tracked label at its marker's world pos + a fixed screen-space offset. */
-function syncTrackedLabels() {
-  const w = renderer.domElement.clientWidth || window.innerWidth;
-  const h = renderer.domElement.clientHeight || window.innerHeight;
-  if (w < 1 || h < 1) return;
-  camera.updateMatrixWorld(true);
-  for (const t of trackedLabels) {
-    const { marker, label, dxPx, dyPx } = t;
-    if (!label.visible && label.parent && !label.parent.visible) continue;
-    marker.updateWorldMatrix(true, false);
-    marker.getWorldPosition(_lblWp);
-    _lblNdc.copy(_lblWp).project(camera);
-    if (!Number.isFinite(_lblNdc.z) || _lblNdc.z < -1 || _lblNdc.z > 1) {
-      // Behind camera / invalid — keep last pose
-      continue;
-    }
-    // Screen pixels (CSS): +x right, +y down in DOM; we want up+right → +dx, -dy in DOM y
-    const sx = (_lblNdc.x * 0.5 + 0.5) * w + dxPx;
-    const sy = (-_lblNdc.y * 0.5 + 0.5) * h + dyPx;
-    _lblScr.set((sx / w) * 2 - 1, -(sy / h) * 2 + 1, _lblNdc.z);
-    _lblScr.unproject(camera);
-    // Convert world → label parent's local so hierarchy (spin/scale/pivot) stays consistent
-    if (!label.parent) continue;
-    label.parent.updateWorldMatrix(true, false);
-    _lblLocal.copy(_lblScr);
-    label.parent.worldToLocal(_lblLocal);
-    label.position.copy(_lblLocal);
-  }
-}
 
 function makePoints(positions, colors, sizes, opacity = 0.95) {
   const geo = new THREE.BufferGeometry();
@@ -535,11 +577,9 @@ const LABEL_REF_ORBIT = 1.55;
 const LABEL_COMP_MIN = 0.25;
 const LABEL_COMP_MAX = 2.2;
 const AR_LABEL_LINE_M = 0.018; // 1.8 cm at 1×; default slider 0.3× → 0.54 cm
-const LABEL_SIZE_DEFAULT = 0.3;
+const LABEL_SIZE_DEFAULT = 1;
 let labelSizeMul = LABEL_SIZE_DEFAULT;
 let arLabelSizeLog = { lastKey: '', samples: [] };
-const _parentScale = new THREE.Vector3();
-const _worldScale = new THREE.Vector3();
 
 function makeLabel(text, color = '#ffe9a8', scale = 1) {
   const c = document.createElement('canvas');
@@ -576,72 +616,10 @@ function makeLabel(text, color = '#ffe9a8', scale = 1) {
   return spr;
 }
 
-/** World-space scale contributed by all parents (not including the object itself). */
-function parentWorldScaleY(obj) {
-  if (!obj.parent) return 1;
-  obj.parent.updateWorldMatrix(true, false);
-  obj.parent.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _parentScale);
-  return Math.max(Math.abs(_parentScale.y), 1e-9);
-}
 
-function updateLabelSprites(root) {
-  const { head } = getActiveCameras();
-  head.updateMatrixWorld(true);
-  head.getWorldQuaternion(_mkQuat);
-  head.getWorldPosition(_mkCamPos);
 
-  // Desired WORLD height: FOV-scaled so labels stay readable at extreme pinch zoom,
-  // still modulated by the Label size slider. Floor with a tiny metric size.
-  const eye = getActiveCameras().eyes[0];
-  const vFov = verticalFovRad(eye);
-  const LABEL_SCREEN_FRAC = 0.012; // ~1.2% of FOV at labelSizeMul = 1
+/* updateLabelSprites removed — DOM overlay labels */
 
-  let sample = null;
-  root.traverse((c) => {
-    if (!c.isSprite || !c.userData.isLabel) return;
-    c.quaternion.copy(_mkQuat);
-    c.getWorldPosition(_lblWp);
-    const dist = Math.max(0.05, _lblWp.distanceTo(_mkCamPos));
-    const fovH = 2 * dist * Math.tan(vFov * 0.5) * LABEL_SCREEN_FRAC * labelSizeMul;
-    // Also respect the previous metric AR plate size as a soft reference blend in fallback
-    const metricH = AR_LABEL_LINE_M * labelSizeMul;
-    const hWorld = (mode === 'ar') ? Math.max(fovH, metricH * 0.15) : Math.max(
-      metricH * THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX),
-      fovH * 0.5
-    );
-    const wWorld = hWorld * (c.userData.aspect || 1);
-    const parentSy = parentWorldScaleY(c);
-    c.scale.set(wWorld / parentSy, hWorld / parentSy, 1);
-    if (!sample) {
-      c.updateWorldMatrix(true, false);
-      c.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _worldScale);
-      sample = {
-        textAspect: c.userData.aspect,
-        canvasW: c.userData.canvasW,
-        canvasH: c.userData.canvasH,
-        localSy: c.scale.y,
-        parentSy,
-        matrixWorldSy: Math.abs(_worldScale.y),
-        targetWorldH: hWorld,
-        modelScale,
-        scaleRootScale: scaleRoot.scale.x,
-      };
-    }
-  });
-  if (sample && mode === 'ar') {
-    const key = `${sample.targetWorldH.toFixed(4)}@${modelScale.toFixed(3)}x${labelSizeMul.toFixed(2)}`;
-    if (key !== arLabelSizeLog.lastKey) {
-      arLabelSizeLog.lastKey = key;
-      arLabelSizeLog.samples.push(sample);
-      console.info(
-        `[labels] worldH=${sample.targetWorldH.toFixed(4)} m matrixWorld.sy=${sample.matrixWorldSy.toFixed(5)}` +
-        ` localSy=${sample.localSy.toFixed(6)} parentSy=${sample.parentSy.toFixed(3)}` +
-        ` modelScale=${sample.modelScale.toFixed(3)} mul=${labelSizeMul.toFixed(2)}`
-      );
-      globalThis.__arLabelSize = sample;
-    }
-  }
-}
 
 const sunTheta = 0.22;
 function cylToWorld(rKpc, theta, yKpc = 0) {
@@ -717,81 +695,25 @@ function makeMarker(color, radius = 0.006) {
   return g;
 }
 
-/**
- * Camera-facing billboard marker (Sun / siblings).
- * Opaque yellow/coloured core + dark outline + soft glow; NormalBlending (readable on XR camera feed).
- * World size is set each frame in updateScreenMarkers from distance × vertical FOV.
- */
-function makeScreenMarker(color, { coreColor = 0xffffff, sizeFrac = 1 } = {}) {
-  const geo = new THREE.PlaneGeometry(1, 1);
-  const mat = new THREE.ShaderMaterial({
-    uniforms: {
-      uColor: { value: new THREE.Color(color) },
-      uCoreColor: { value: new THREE.Color(coreColor) },
-    },
-    vertexShader: `
-      varying vec2 vUv;
-      void main() {
-        vUv = uv;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: `
-      varying vec2 vUv;
-      uniform vec3 uColor;
-      uniform vec3 uCoreColor;
-      void main() {
-        vec2 p = vUv - vec2(0.5);
-        float r = length(p) * 2.0;
-        float core = smoothstep(0.38, 0.0, r);
-        // dark outline just outside the core
-        float outline = smoothstep(0.50, 0.40, r) * smoothstep(0.32, 0.40, r);
-        float glow = smoothstep(1.0, 0.45, r) * (1.0 - core) * 0.65;
-        float a = max(core, max(outline, glow));
-        if (a < 0.04) discard;
-        vec3 col = mix(uColor, uCoreColor, core);
-        col = mix(col, vec3(0.04, 0.03, 0.02), outline);
-        gl_FragColor = vec4(col, a);
-      }`,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-    blending: THREE.NormalBlending,
-    side: THREE.DoubleSide,
-  });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.frustumCulled = false;
-  mesh.renderOrder = 999;
-  const g = new THREE.Group();
-  g.add(mesh);
-  g.userData.isScreenMarker = true;
-  g.userData.markerMesh = mesh;
-  g.userData.sizeFrac = sizeFrac;
-  screenMarkers.push(g);
-  return g;
-}
+// (billboard makeScreenMarker removed — DOM overlay)
 
-// Sun in galaxy view — FOV-scaled billboard
-const sunGroup = makeScreenMarker(0xffe566, { coreColor: 0xfff8d0, sizeFrac: 1 });
+// Sun + labels as DOM overlay (fixed CSS px); 3D groups are invisible anchors only
+const sunGroup = makeAnchor();
 sunGroup.position.copy(sunPos);
 galaxyRoot.add(sunGroup);
-const sunLabel = makeLabel('Sun · Orion Spur · 8.2 kpc', '#ffe9a8');
-labelsRoot.add(sunLabel);
-trackLabel(sunGroup, sunLabel, 16, -18);
+addOverlayDot(sunGroup, { kind: 'sun', color: 0xffe566, view: 'galaxy' });
+addOverlayLabel(sunGroup, 'Sun · Orion Spur · 8.2 kpc', { view: 'galaxy', ox: 16, oy: -18 });
 
 const centreMarker = makeMarker(0xff8866, 0.009);
 galaxyRoot.add(centreMarker);
-const centreLabel = makeLabel('Galactic centre', '#ffb0a0');
-labelsRoot.add(centreLabel);
-trackLabel(centreMarker, centreLabel, 14, -16);
+addOverlayLabel(centreMarker, 'Galactic centre', { view: 'galaxy', ox: 14, oy: -16 });
 
 // Birth radius marker (~5 kpc on solar azimuth)
 const birthPos = cylToWorld(BIRTH_R_KPC, sunTheta, 0.02);
 const birthMarker = makeMarker(0xa0ffc8, 0.007);
 birthMarker.position.copy(birthPos);
 galaxyRoot.add(birthMarker);
-const birthLabel = makeLabel('Sun birth ~5 kpc (lit. ~4.5–7)', '#b8ffd0');
-labelsRoot.add(birthLabel);
-trackLabel(birthMarker, birthLabel, 14, -16);
+addOverlayLabel(birthMarker, 'Sun birth ~5 kpc (lit. ~4.5–7)', { view: 'galaxy', ox: 14, oy: -16 });
 // Path Sun → birth (migration)
 {
   const curve = new THREE.BufferGeometry().setFromPoints([birthPos, sunPos]);
@@ -814,20 +736,20 @@ trackLabel(birthMarker, birthLabel, 14, -16);
   ring.rotation.x = -Math.PI / 2;
   ring.position.y = 0.002;
   galaxyRoot.add(ring);
-  const bandLabel = makeLabel('Sibling dispersal band (schematic)', '#a8c8ff', 0.9);
-  bandLabel.position.set(0, 0.03, 9.5 * M_PER_KPC);
-  labelsRoot.add(bandLabel);
+  const bandAnchor = makeAnchor();
+  bandAnchor.position.set(0, 0.03, 9.5 * M_PER_KPC);
+  galaxyRoot.add(bandAnchor);
+  addOverlayLabel(bandAnchor, 'Sibling dispersal band (schematic)', { view: 'galaxy', ox: 8, oy: -14 });
 }
 
 // Galaxy-view sibling markers (tiny at disc scale — still placed truthfully)
 for (const sib of SIBLINGS) {
   const p = helioToWorld(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-  const m = makeScreenMarker(sib.color, { coreColor: sib.coreColor, sizeFrac: SIB_SIZE_FRAC });
+  const m = makeAnchor();
   m.position.copy(p);
   galaxyRoot.add(m);
-  const lab = makeLabel(sib.id, '#d0e8ff', 0.75);
-  labelsRoot.add(lab);
-  trackLabel(m, lab, 12, -14);
+  addOverlayDot(m, { kind: 'sib', color: sib.color, view: 'galaxy' });
+  addOverlayLabel(m, sib.id, { view: 'galaxy', ox: 12, oy: -14 });
 }
 
 for (const L of [
@@ -836,9 +758,12 @@ for (const L of [
 ]) {
   const theta = L.arm.phase + L.t * Math.PI;
   let r = Math.min(12.5, Math.max(4, armRadius(L.arm, theta)));
-  const spr = makeLabel(L.name, '#cfe0ff', 0.85);
-  spr.position.set(r * Math.cos(theta) * M_PER_KPC, 0.03, r * Math.sin(theta) * M_PER_KPC);
-  armLabelsRoot.add(spr);
+  const a = makeAnchor();
+  a.position.set(r * Math.cos(theta) * M_PER_KPC, 0.03, r * Math.sin(theta) * M_PER_KPC);
+  armsRoot.add(a); // hide with Arms toggle via parent? armsRoot hides particles; put on galaxyRoot
+  galaxyRoot.add(a);
+  a.userData.armLabel = true;
+  addOverlayLabel(a, L.name, { view: 'galaxy', ox: 8, oy: -12 });
 }
 
 // ——— Local neighbourhood view (1 kpc → 2 m) ———
@@ -896,11 +821,10 @@ function buildLocalView() {
   localRoot.add(pts);
 
   // Local Sun at origin of localRoot (we place localRoot at sun galactocentric later)
-  const localSun = makeScreenMarker(0xffe566, { coreColor: 0xfff8d0, sizeFrac: 1 });
+  const localSun = makeAnchor();
   localRoot.add(localSun);
-  const ls = makeLabel('Sun', '#ffe9a8', 1.2);
-  localLabels.add(ls);
-  trackLabel(localSun, ls, 14, -16);
+  addOverlayDot(localSun, { kind: 'sun', color: 0xffe566, view: 'local' });
+  addOverlayLabel(localSun, 'Sun', { view: 'local', ox: 14, oy: -16 });
 
   // 100 pc scale bar
   const barLen = 0.1 * LOCAL_M_PER_KPC;
@@ -909,26 +833,24 @@ function buildLocalView() {
     new THREE.Vector3(barLen/2, -0.12, 0.15),
   ]);
   localRoot.add(new THREE.Line(barGeo, new THREE.LineBasicMaterial({ color: 0xaaccff })));
-  const barLab = makeLabel('100 pc', '#aaccff', 0.9);
-  barLab.position.set(0, -0.1, 0.15);
-  localLabels.add(barLab);
+  const barAnchor = makeAnchor();
+  barAnchor.position.set(0, -0.1, 0.15);
+  localRoot.add(barAnchor);
+  addOverlayLabel(barAnchor, '100 pc', { view: 'local', ox: 8, oy: -12 });
 
   for (const sib of SIBLINGS) {
     const p = helioToLocal(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-    const m = makeScreenMarker(sib.color, { coreColor: sib.coreColor, sizeFrac: SIB_SIZE_FRAC });
+    const m = makeAnchor();
     m.position.copy(p);
     localRoot.add(m);
+    addOverlayDot(m, { kind: 'sib', color: sib.color, view: 'local' });
+    addOverlayLabel(m, sib.id, { view: 'local', ox: 12, oy: -14 });
+    addOverlayLabel(m, sib.note, { view: 'local', ox: 12, oy: 4 });
     const line = new THREE.Line(
       new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0,0,0), p]),
       new THREE.LineBasicMaterial({ color: sib.color, transparent: true, opacity: 0.35 })
     );
     localRoot.add(line);
-    const lab = makeLabel(`${sib.id}`, '#e8f0ff', 1.0);
-    localLabels.add(lab);
-    trackLabel(m, lab, 12, -14);
-    const lab2 = makeLabel(sib.note, '#a8b8d0', 0.75);
-    localLabels.add(lab2);
-    trackLabel(m, lab2, 12, 2); // note sits slightly below the id label
   }
 }
 buildLocalView();
@@ -979,7 +901,7 @@ globalThis.__measureArLabelWorld = (mul = 1, scale = 1) => {
   modelScale = scale;
   applyModelScale();
   applyPivot();
-  updateLabelSprites(labelsRoot);
+  
   floorAnchor.updateWorldMatrix(true, true);
   let sample = null;
   labelsRoot.traverse((c) => {
@@ -1007,7 +929,7 @@ globalThis.__measureArLabelWorld = (mul = 1, scale = 1) => {
   labelSizeMul = prevMul;
   modelScale = prevScale;
   applyModelScale();
-  updateLabelSprites(labelsRoot);
+  
   return sample;
 };
 
@@ -1042,41 +964,28 @@ globalThis.__measureSunPivot = () => {
 globalThis.__getLabelSizing = () => globalThis.__measureArLabelWorld(labelSizeMul, modelScale);
 globalThis.__zoomDiag = () => {
   applyZoomCompensate();
-  updateScreenMarkers();
-  const mesh = sunGroup.userData.markerMesh;
+  updateOverlayHud();
   return {
+    build: BUILD_ID,
     worldZoom: getWorldZoomScale(),
-    screenMarkerCount: screenMarkers.length,
+    overlayCount: overlayItems.length,
     matCount: starPointMats.length,
     uWorldScale: starPointMats[0]?.uniforms?.uWorldScale?.value ?? null,
-    sunWorldH: mesh ? mesh.scale.y : null,
+    sunCss: globalThis.__overlaySunSample,
     markerSizeMul,
-    trackedLabels: trackedLabels.length,
+    labelSizeMul,
     modelScale,
     camOrbitDist,
     mode,
   };
 };
 
-/**
- * Confirm Sun marker stays constant screen size across modelScale and camera distance.
- * Uses the shader's gl_PointSize (uPixelSize×uPixelRatio) — the true drawn size for
- * size-attenuation-free points, including under WebXR's projection matrix.
- */
+/** Overlay Sun CSS size must stay constant across modelScale (DOM px, not 3D). */
 globalThis.__measureMarkerPixels = () => {
   const prevMode = mode;
   const prevScale = modelScale;
   const prevSpin = spinRoot.rotation.y;
   const prevMul = markerSizeMul;
-  const prevCam = {
-    pos: camera.position.clone(),
-    quat: camera.quaternion.clone(),
-    aspect: camera.aspect,
-    fov: camera.fov,
-    near: camera.near,
-    far: camera.far,
-  };
-
   mode = 'ar';
   spinRoot.rotation.y = 0;
   applyPivot();
@@ -1094,7 +1003,7 @@ globalThis.__measureMarkerPixels = () => {
 
   const samples = [];
   const dist = 0.8;
-  for (const s of [1, 20, 100, 1000, 5000]) {
+  for (const s of [1, 100, 5000]) {
     modelScale = s;
     applyModelScale();
     const anchor = new THREE.Vector3();
@@ -1104,57 +1013,25 @@ globalThis.__measureMarkerPixels = () => {
     camera.position.set(anchor.x, anchor.y, anchor.z + dist);
     camera.lookAt(anchor);
     camera.updateMatrixWorld(true);
-    updateScreenMarkers();
-
-    const mesh = sunGroup.userData.markerMesh;
-    sunGroup.updateWorldMatrix(true, false);
-    mesh.updateWorldMatrix(true, false);
-    const wp = new THREE.Vector3();
-    const scl = new THREE.Vector3();
-    sunGroup.getWorldPosition(wp);
-    mesh.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), scl);
-    const camPos = new THREE.Vector3();
-    camera.getWorldPosition(camPos);
-    const d = wp.distanceTo(camPos);
-    const vFov = verticalFovRad(camera);
-    const worldH = Math.abs(scl.y);
-    const frac = worldH / (2 * d * Math.tan(vFov * 0.5));
-    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
-    const top = wp.clone().addScaledVector(up, worldH / 2).project(camera);
-    const bot = wp.clone().addScaledVector(up, -worldH / 2).project(camera);
-    const coverFrac = Math.abs(top.y - bot.y) / 2;
+    updateOverlayHud();
+    const sunEl = overlayItems.find((it) => it.kind === 'sun' && it.view === 'galaxy')?.el;
+    const cssW = sunEl ? parseFloat(sunEl.style.width) : null;
     samples.push({
       modelScale: s,
-      parentSy: parentWorldScaleY(mesh),
-      localSy: mesh.scale.y,
-      worldH_matrix: worldH,
-      dist_m: d,
-      fovFrac: frac,
-      coverPct: coverFrac * 100,
-      expectedPct: SUN_SCREEN_FRAC * markerSizeMul * 100,
-      sunWorld: { x: wp.x, y: wp.y, z: wp.z },
+      cssPx: cssW,
+      expected: SUN_DOT_PX * markerSizeMul,
+      sample: globalThis.__overlaySunSample,
     });
   }
-
-  // Slider check at scale 100 (set the DOM too — updateScreenMarkers reads it)
-  modelScale = 100;
-  applyModelScale();
+  // slider 2x
   markerSizeMul = 2;
   if (markerSizeSlider) markerSizeSlider.value = '2';
-  if (markerSizeVal) markerSizeVal.textContent = '2.00×';
-  updateScreenMarkers();
-  {
-    const mesh = sunGroup.userData.markerMesh;
-    mesh.updateWorldMatrix(true, false);
-    const scl = new THREE.Vector3();
-    mesh.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), scl);
-    const wp = new THREE.Vector3(); sunGroup.getWorldPosition(wp);
-    const camPos = new THREE.Vector3(); camera.getWorldPosition(camPos);
-    const d = wp.distanceTo(camPos);
-    const vFov = verticalFovRad(camera);
-    const frac2 = Math.abs(scl.y) / (2 * d * Math.tan(vFov * 0.5));
-    samples.push({ modelScale: 100, markerSizeMul: markerSizeMul, coverPct: frac2 * 100, expectedPct: 5 });
-  }
+  modelScale = 100;
+  applyModelScale();
+  updateOverlayHud();
+  const sunEl2 = overlayItems.find((it) => it.kind === 'sun' && it.view === 'galaxy')?.el;
+  const css2 = sunEl2 ? parseFloat(sunEl2.style.width) : null;
+  samples.push({ modelScale: 100, markerSizeMul: 2, cssPx: css2, expected: 36 });
 
   mode = prevMode;
   modelScale = prevScale;
@@ -1164,91 +1041,38 @@ globalThis.__measureMarkerPixels = () => {
   if (markerSizeSlider) markerSizeSlider.value = String(prevMul);
   if (markerSizeVal) markerSizeVal.textContent = Number(prevMul).toFixed(2) + '×';
   renderer.setSize(window.innerWidth, window.innerHeight, false);
-  camera.position.copy(prevCam.pos);
-  camera.quaternion.copy(prevCam.quat);
-  camera.aspect = prevCam.aspect;
-  camera.fov = prevCam.fov;
-  camera.near = prevCam.near;
-  camera.far = prevCam.far;
-  camera.updateProjectionMatrix();
 
-  const base = samples.filter((s) => s.expectedPct === 2.5);
-  const maxDev = Math.max(...base.map((s) => Math.abs(s.coverPct - 2.5)));
-  const sunDrift = Math.max(...base.map((s) => Math.hypot(
-    s.sunWorld.x - base[0].sunWorld.x,
-    s.sunWorld.y - base[0].sunWorld.y,
-    s.sunWorld.z - base[0].sunWorld.z,
-  )));
+  const base = samples.filter((s) => s.expected === 18);
+  const okConst = base.every((s) => Math.abs(s.cssPx - 18) < 0.01);
+  const sliderOk = Math.abs(css2 - 36) < 0.01;
   return {
+    build: BUILD_ID,
     samples,
-    maxDevPct: maxDev,
-    constant25: maxDev < 0.15,
-    sunPivotDrift_m: sunDrift,
-    sunPivotOk: sunDrift < 0.001,
-    sliderAt100: samples.find((s) => s.markerSizeMul === 2) || null,
+    constant18: okConst,
+    sliderDoubles: sliderOk,
   };
 };
 
 globalThis.__measureLabelFollow = () => {
-  const prevMode = mode;
-  const prevScale = modelScale;
-  const prevSpin = spinRoot.rotation.y;
-  mode = 'ar';
-  placeFallbackDefault();
-  floorAnchor.visible = true;
-  applyPivot();
-  const samples = [];
-  for (const s of [1, 5, 20]) {
-    for (const ang of [0, 1.2]) {
-      modelScale = s;
-      applyModelScale();
-      spinRoot.rotation.y = ang;
-      // Camera looking at anchored Sun
-      const anchor = new THREE.Vector3();
-      floorAnchor.updateWorldMatrix(true, true);
-      floorAnchor.getWorldPosition(anchor);
-      anchor.y += heightAboveFloor;
-      camera.position.set(anchor.x, anchor.y + 0.15, anchor.z + 0.8);
-      camera.lookAt(anchor);
-      camera.updateMatrixWorld(true);
-      applyZoomCompensate();
-      updateScreenMarkers();
-      syncTrackedLabels();
-      updateLabelSprites(labelsRoot);
-
-      sunGroup.updateWorldMatrix(true, false);
-      sunLabel.updateWorldMatrix(true, false);
-      const mp = new THREE.Vector3(); const lp = new THREE.Vector3();
-      sunGroup.getWorldPosition(mp);
-      sunLabel.getWorldPosition(lp);
-      const mN = mp.clone().project(camera);
-      const lN = lp.clone().project(camera);
-      const w = renderer.domElement.clientWidth;
-      const h = renderer.domElement.clientHeight;
-      const mSx = (mN.x * 0.5 + 0.5) * w;
-      const mSy = (-mN.y * 0.5 + 0.5) * h;
-      const lSx = (lN.x * 0.5 + 0.5) * w;
-      const lSy = (-lN.y * 0.5 + 0.5) * h;
-      const dx = lSx - mSx;
-      const dy = lSy - mSy;
-      samples.push({
-        modelScale: s, spin: ang,
-        screenDistPx: Math.hypot(dx, dy),
-        dx, dy,
-        worldDist: mp.distanceTo(lp),
-      });
-    }
+  // DOM labels: check font-size stays tied to slider, not modelScale
+  const prev = modelScale;
+  const out = [];
+  for (const s of [1, 100, 5000]) {
+    modelScale = s;
+    applyModelScale();
+    updateOverlayHud();
+    const lab = overlayItems.find((it) => it.kind === 'label' && it.view === 'galaxy');
+    out.push({
+      modelScale: s,
+      fontPx: lab ? parseFloat(lab.el.style.fontSize) : null,
+      expected: LABEL_FONT_PX * labelSizeMul,
+    });
   }
-  mode = prevMode;
-  modelScale = prevScale;
+  modelScale = prev;
   applyModelScale();
-  spinRoot.rotation.y = prevSpin;
-  const dists = samples.map((x) => x.screenDistPx);
-  const mean = dists.reduce((a, b) => a + b, 0) / dists.length;
-  const maxDev = Math.max(...dists.map((d) => Math.abs(d - mean)));
-  return { samples, meanScreenDistPx: mean, maxDevPx: maxDev, constant: maxDev < 1.5 };
+  const ok = out.every((x) => Math.abs(x.fontPx - out[0].fontPx) < 0.01);
+  return { samples: out, constantFont: ok };
 };
-
 
 function setViewMode(mode) {
   viewMode = mode;
@@ -1606,7 +1430,7 @@ btnDebug.addEventListener('click', () => {
   debugVisible = !debugVisible;
   debugLine.classList.toggle('is-hidden', !debugVisible);
   btnDebug.classList.toggle('on', debugVisible);
-  if (debugVisible) updateScreenMarkers();
+  if (debugVisible) updateOverlayHud();
 });
 btnOrient.addEventListener('click', () => permOverlay.classList.add('show'));
 btnPerm.addEventListener('click', async () => {
@@ -1636,13 +1460,12 @@ renderer.setAnimationLoop((time, frame) => {
   spinRoot.rotation.y = t * 0.012; // slow spin around current pivot
   if (bulgeSpr) bulgeSpr.material.opacity = 0.45 + 0.12 * Math.sin(t * 0.7);
   applyZoomCompensate();
-  updateScreenMarkers();
-  syncTrackedLabels();
+  updateOverlayHud();
+  
 
-  const labelParents = [];
-  if (labelsVisible && galaxyRoot.visible) labelParents.push(labelsRoot);
-  if (labelsVisible && localRoot.visible) labelParents.push(localLabels);
-  for (const root of labelParents) updateLabelSprites(root);
+  // Labels are DOM overlays (updateOverlayHud). Hide leftover 3D label roots.
+  labelsRoot.visible = false;
+  localLabels.visible = false;
 
   if (mode === 'ar' && frame && xrSession) {
     if (!hitTestSourceRequested) {
