@@ -157,14 +157,15 @@ function armRadius(arm, theta) {
   return arm.a0 * Math.exp(b * (theta - arm.phase));
 }
 
-// Star / marker zoom compensation (AR modelScale + fallback cam distance)
+// Field-star zoom compensation (AR modelScale + fallback cam distance).
+// Sun / sibling markers are constant screen-size points (see makeScreenMarker).
 const starPointMats = [];
-const zoomMarkers = []; // Sun + sibling (and other) mesh markers
+const screenMarkers = []; // Groups wrapping fixed-px Points (Sun, siblings)
 const POINT_SIZE_MIN_PX = 0.7;
 const POINT_SIZE_MAX_PX = 12.0;
-const MARKER_SCALE_MIN = 0.06;
-const MARKER_SCALE_MAX = 1.6;
 const ZOOM_REF_ORBIT = 1.55; // matches default camOrbitDist
+const SUN_MARKER_PX = 7.5;
+const SIB_MARKER_PX = 4.5;
 
 function getWorldZoomScale() {
   // AR: pinch scales scaleRoot. Fallback: closer camera ≈ larger on-screen size.
@@ -178,9 +179,14 @@ function applyZoomCompensate() {
   for (const mat of starPointMats) {
     if (mat.uniforms.uWorldScale) mat.uniforms.uWorldScale.value = z;
   }
-  // Markers shrink when zooming in (user request); clamp so they neither vanish nor blob when zoomed out
-  const ms = THREE.MathUtils.clamp(1 / z, MARKER_SCALE_MIN, MARKER_SCALE_MAX);
-  for (const m of zoomMarkers) m.scale.setScalar(ms);
+  // Keep screen-marker pixel size in sync with the active renderer (incl. WebXR)
+  const pr = Math.min(renderer.getPixelRatio(), 2);
+  for (const g of screenMarkers) {
+    const pts = g.userData.markerPoints;
+    if (pts?.material?.uniforms?.uPixelRatio) {
+      pts.material.uniforms.uPixelRatio.value = pr;
+    }
+  }
 }
 
 function makePoints(positions, colors, sizes, opacity = 0.95) {
@@ -564,22 +570,75 @@ const SIBLINGS = [
   },
 ];
 
-function makeMarker(color, radius = 0.006, { zoomCompensate = false } = {}) {
+/** World-size sphere markers (galactic centre / birth only — may scale with the model). */
+function makeMarker(color, radius = 0.006) {
   const g = new THREE.Group();
   g.add(new THREE.Mesh(
     new THREE.SphereGeometry(radius, 14, 14),
     new THREE.MeshBasicMaterial({ color })
   ));
-  g.add(new THREE.Mesh(
-    new THREE.SphereGeometry(radius * 2.2, 14, 14),
-    new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.28, depthWrite: false })
-  ));
-  if (zoomCompensate) zoomMarkers.push(g);
   return g;
 }
 
-// Sun in galaxy view
-const sunGroup = makeMarker(0xffe566, 0.008, { zoomCompensate: true });
+/**
+ * Constant screen-size marker (Sun / siblings).
+ * gl_PointSize is fixed in CSS pixels × devicePixelRatio — independent of
+ * modelScale, distance, and WebXR projection. No world-space halo.
+ */
+function makeScreenMarker(color, pixelSize) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0], 3));
+  const mat = new THREE.ShaderMaterial({
+    uniforms: {
+      pointTexture: { value: starTex },
+      uColor: { value: new THREE.Color(color) },
+      uPixelSize: { value: pixelSize },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio || 1, 2) },
+    },
+    vertexShader: `
+      uniform float uPixelSize;
+      uniform float uPixelRatio;
+      void main() {
+        // Constant framebuffer pixels — no distance / modelScale term
+        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = uPixelSize * uPixelRatio;
+        gl_Position = projectionMatrix * mvPosition;
+      }`,
+    fragmentShader: `
+      uniform sampler2D pointTexture;
+      uniform vec3 uColor;
+      void main() {
+        vec4 tex = texture2D(pointTexture, gl_PointCoord);
+        if (tex.a < 0.05) discard;
+        gl_FragColor = vec4(uColor, tex.a);
+      }`,
+    transparent: true,
+    depthWrite: false,
+    depthTest: false,
+    blending: THREE.AdditiveBlending,
+  });
+  const pts = new THREE.Points(geo, mat);
+  pts.frustumCulled = false;
+  pts.renderOrder = 10;
+  const g = new THREE.Group();
+  g.add(pts);
+  g.userData.isScreenMarker = true;
+  g.userData.pixelSize = pixelSize;
+  g.userData.markerPoints = pts;
+  screenMarkers.push(g);
+  return g;
+}
+
+/** Effective gl_PointSize in framebuffer pixels for a screen marker. */
+function screenMarkerFbPx(g) {
+  const pts = g.userData.markerPoints;
+  if (!pts?.material?.uniforms) return null;
+  const u = pts.material.uniforms;
+  return u.uPixelSize.value * u.uPixelRatio.value;
+}
+
+// Sun in galaxy view — fixed ~7.5 CSS px (× DPR)
+const sunGroup = makeScreenMarker(0xffe566, SUN_MARKER_PX);
 sunGroup.position.copy(sunPos);
 galaxyRoot.add(sunGroup);
 const sunLabel = makeLabel('Sun · Orion Spur · 8.2 kpc', '#ffe9a8');
@@ -630,7 +689,7 @@ labelsRoot.add(birthLabel);
 // Galaxy-view sibling markers (tiny at disc scale — still placed truthfully)
 for (const sib of SIBLINGS) {
   const p = helioToWorld(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-  const m = makeMarker(sib.color, 0.004, { zoomCompensate: true });
+  const m = makeScreenMarker(sib.color, SIB_MARKER_PX);
   m.position.copy(p);
   galaxyRoot.add(m);
   const lab = makeLabel(sib.id, '#d0e8ff', 0.75);
@@ -704,7 +763,7 @@ function buildLocalView() {
   localRoot.add(pts);
 
   // Local Sun at origin of localRoot (we place localRoot at sun galactocentric later)
-  const localSun = makeMarker(0xffe566, 0.025, { zoomCompensate: true });
+  const localSun = makeScreenMarker(0xffe566, SUN_MARKER_PX);
   localRoot.add(localSun);
   const ls = makeLabel('Sun', '#ffe9a8', 1.2);
   ls.position.set(0, 0.08, 0);
@@ -723,7 +782,7 @@ function buildLocalView() {
 
   for (const sib of SIBLINGS) {
     const p = helioToLocal(sib.xyz[0], sib.xyz[1], sib.xyz[2]);
-    const m = makeMarker(sib.color, 0.018, { zoomCompensate: true });
+    const m = makeScreenMarker(sib.color, SIB_MARKER_PX);
     m.position.copy(p);
     localRoot.add(m);
     // connector to Sun
@@ -839,13 +898,92 @@ globalThis.__zoomDiag = () => {
   applyZoomCompensate();
   return {
     worldZoom: getWorldZoomScale(),
-    markerCount: zoomMarkers.length,
+    screenMarkerCount: screenMarkers.length,
     matCount: starPointMats.length,
     uWorldScale: starPointMats[0]?.uniforms?.uWorldScale?.value ?? null,
-    markerScale: zoomMarkers[0]?.scale?.x ?? null,
+    sunFbPx: screenMarkerFbPx(sunGroup),
     modelScale,
     camOrbitDist,
     mode,
+  };
+};
+
+/**
+ * Confirm Sun marker stays constant screen size across modelScale and camera distance.
+ * Uses the shader's gl_PointSize (uPixelSize×uPixelRatio) — the true drawn size for
+ * size-attenuation-free points, including under WebXR's projection matrix.
+ */
+globalThis.__measureMarkerPixels = () => {
+  const prevMode = mode;
+  const prevScale = modelScale;
+  const prevSpin = spinRoot.rotation.y;
+  const prevCam = {
+    pos: camera.position.clone(),
+    quat: camera.quaternion.clone(),
+    near: camera.near,
+    far: camera.far,
+  };
+  mode = 'ar';
+  spinRoot.rotation.y = 0;
+  applyPivot();
+  placeFallbackDefault();
+  floorAnchor.visible = true;
+
+  const samples = [];
+  for (const s of [1, 5, 20]) {
+    for (const dist of [0.1, 1.0]) {
+      modelScale = s;
+      applyModelScale();
+      // Place camera along +Z looking at the anchored Sun (floatRoot origin ≈ Sun)
+      const anchor = new THREE.Vector3();
+      floorAnchor.getWorldPosition(anchor);
+      anchor.y += heightAboveFloor;
+      camera.position.set(anchor.x, anchor.y, anchor.z + dist);
+      camera.lookAt(anchor);
+      camera.updateMatrixWorld(true);
+      floorAnchor.updateWorldMatrix(true, true);
+      applyZoomCompensate();
+
+      const fbPx = screenMarkerFbPx(sunGroup);
+      // Also project Sun world → NDC → CSS pixels (extent of a 0-radius point is the gl_PointSize)
+      sunGroup.updateWorldMatrix(true, false);
+      const wp = new THREE.Vector3();
+      sunGroup.getWorldPosition(wp);
+      const ndc = wp.clone().project(camera);
+      const halfW = renderer.domElement.clientWidth / 2;
+      const halfH = renderer.domElement.clientHeight / 2;
+      samples.push({
+        modelScale: s,
+        camDist_m: dist,
+        glPointSize_fbPx: fbPx,
+        glPointSize_cssPx: fbPx / Math.min(renderer.getPixelRatio(), 2),
+        ndc: { x: ndc.x, y: ndc.y, z: ndc.z },
+        screenPx: { x: ndc.x * halfW + halfW, y: -ndc.y * halfH + halfH },
+      });
+    }
+  }
+
+  // restore
+  mode = prevMode;
+  modelScale = prevScale;
+  applyModelScale();
+  spinRoot.rotation.y = prevSpin;
+  camera.position.copy(prevCam.pos);
+  camera.quaternion.copy(prevCam.quat);
+  camera.near = prevCam.near;
+  camera.far = prevCam.far;
+  camera.updateProjectionMatrix();
+
+  const sizes = samples.map((s) => s.glPointSize_fbPx);
+  const minS = Math.min(...sizes);
+  const maxS = Math.max(...sizes);
+  return {
+    sunCssPx: SUN_MARKER_PX,
+    sibCssPx: SIB_MARKER_PX,
+    samples,
+    minFbPx: minS,
+    maxFbPx: maxS,
+    constant: Math.abs(maxS - minS) < 1e-6,
   };
 };
 
