@@ -42,10 +42,11 @@ let pivotMode = 'sun'; // 'sun' | 'galaxy' — AR/fallback placed point
 let infoOpen = false;
 
 function applyPivot() {
+  // Offset is under spinRoot & scaleRoot, so world pivot = floatRoot origin for any scale/spin.
   if (pivotMode === 'sun') {
-    pivotOffset.position.set(-sunPos.x, -sunPos.y, -sunPos.z);
+    offsetRoot.position.set(-sunPos.x, -sunPos.y, -sunPos.z);
   } else {
-    pivotOffset.position.set(0, 0, 0);
+    offsetRoot.position.set(0, 0, 0);
   }
   if (btnPivot) {
     btnPivot.textContent = pivotMode === 'sun' ? 'Centre: Sun' : 'Centre: Galaxy';
@@ -79,22 +80,27 @@ const key = new THREE.DirectionalLight(0xffe8cc, 0.25);
 key.position.set(1, 2, 1);
 scene.add(key);
 
-// Floor anchor (hit-test / default place). Galaxy floats above by heightAboveFloor.
+// Floor anchor = placed world point. Hierarchy keeps the pivot fixed under pinch+spin:
+//   floorAnchor > floatRoot (height only)
+//     > scaleRoot (pinch scale at origin = placed point)
+//       > spinRoot (rotates about placed point)
+//         > offsetRoot (model offset so Sun or GC sits at the placed point)
+//           > galaxy / local content
 const floorAnchor = new THREE.Group();
 scene.add(floorAnchor);
 const floatRoot = new THREE.Group();
 floorAnchor.add(floatRoot);
 floatRoot.position.y = heightAboveFloor;
 
-// Content offset so the placed point can be the Sun (default) or galactic centre
-const pivotOffset = new THREE.Group();
-floatRoot.add(pivotOffset);
-// Slow spin around the current pivot (Sun or galactic centre)
+const scaleRoot = new THREE.Group();
+floatRoot.add(scaleRoot);
 const spinRoot = new THREE.Group();
-pivotOffset.add(spinRoot);
+scaleRoot.add(spinRoot);
+const offsetRoot = new THREE.Group(); // was offsetRoot; lives UNDER spin so Sun stays fixed
+spinRoot.add(offsetRoot);
 
 const galaxyRoot = new THREE.Group();
-spinRoot.add(galaxyRoot);
+offsetRoot.add(galaxyRoot);
 const labelsRoot = new THREE.Group();
 galaxyRoot.add(labelsRoot);
 const armsRoot = new THREE.Group(); // spiral arms + arm nebulae (toggleable)
@@ -104,7 +110,7 @@ labelsRoot.add(armLabelsRoot);
 
 const localRoot = new THREE.Group();
 localRoot.visible = false;
-spinRoot.add(localRoot);
+offsetRoot.add(localRoot);
 const localLabels = new THREE.Group();
 localRoot.add(localLabels);
 
@@ -350,40 +356,46 @@ function roundRect(ctx, x, y, w, h, r) {
   ctx.arcTo(x, y, x + w, y, r);
   ctx.closePath();
 }
-// Fallback labels stay at ~40% of the original world size (+ orbit compensate).
-// AR labels use a fixed real-world line height in metres (scene units = metres),
-// fully cancelling floatRoot / pinch modelScale so size stays ~1.5–2 cm.
+// Fallback labels: ~40% of the original world size (+ orbit compensate).
+// AR labels: fixed real-world plate height AR_LABEL_LINE_M at labelSizeMul=1 (default mul=0.3).
 const LABEL_SIZE = 0.4;
 const LABEL_REF_ORBIT = 1.55;
 const LABEL_COMP_MIN = 0.25;
 const LABEL_COMP_MAX = 2.2;
-const AR_LABEL_LINE_M = 0.018; // 1.8 cm plate height at labelSizeMul = 1
-let labelSizeMul = 1;
+const AR_LABEL_LINE_M = 0.018; // 1.8 cm at 1×; default slider 0.3× → 0.54 cm
+const LABEL_SIZE_DEFAULT = 0.3;
+let labelSizeMul = LABEL_SIZE_DEFAULT;
 let arLabelSizeLog = { lastKey: '', samples: [] };
+const _parentScale = new THREE.Vector3();
+const _worldScale = new THREE.Vector3();
 
 function makeLabel(text, color = '#ffe9a8', scale = 1) {
   const c = document.createElement('canvas');
   const ctx = c.getContext('2d');
-  const pad = 10;
-  ctx.font = '600 26px system-ui, sans-serif';
-  const w = Math.ceil(ctx.measureText(text).width) + pad * 2;
-  const h = 40; // one text line plate (canvas CSS px before 2× backing store)
+  // Tight padding so the plate ≈ the glyph bounds (avoids a large empty quad)
+  const padX = 4, padY = 3;
+  ctx.font = '600 22px system-ui, sans-serif';
+  const metrics = ctx.measureText(text);
+  const w = Math.ceil(metrics.width) + padX * 2;
+  const h = 22 + padY * 2; // ≈ font size + pad; little transparent margin
   c.width = w * 2; c.height = h * 2;
   ctx.scale(2, 2);
-  ctx.font = '600 26px system-ui, sans-serif';
-  ctx.fillStyle = 'rgba(0,0,12,0.6)';
-  roundRect(ctx, 0, 0, w, h, 9); ctx.fill();
+  ctx.font = '600 22px system-ui, sans-serif';
+  ctx.fillStyle = 'rgba(0,0,12,0.72)';
+  roundRect(ctx, 0, 0, w, h, 5); ctx.fill();
   ctx.fillStyle = color; ctx.textBaseline = 'middle';
-  ctx.fillText(text, pad, h / 2);
+  ctx.fillText(text, padX, h / 2);
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
-  const spr = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false }));
-  // Fallback world size (metres at modelScale=1): previously (h/520)*scale, then ×0.4
+  // sizeAttenuation:true → sprite.scale is metric world size (Three.js default; set explicitly)
+  const spr = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: tex, transparent: true, depthTest: false, sizeAttenuation: true,
+  }));
   const fbSx = (w / 520) * scale * LABEL_SIZE;
   const fbSy = (h / 520) * scale * LABEL_SIZE;
   spr.scale.set(fbSx, fbSy, 1);
   spr.userData.isLabel = true;
-  spr.userData.aspect = w / h;
+  spr.userData.aspect = w / Math.max(h, 1);
   spr.userData.scaleMul = scale;
   spr.userData.fbSx = fbSx;
   spr.userData.fbSy = fbSy;
@@ -392,56 +404,62 @@ function makeLabel(text, color = '#ffe9a8', scale = 1) {
   return spr;
 }
 
+/** World-space scale contributed by all parents (not including the object itself). */
+function parentWorldScaleY(obj) {
+  if (!obj.parent) return 1;
+  obj.parent.updateWorldMatrix(true, false);
+  obj.parent.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _parentScale);
+  return Math.max(Math.abs(_parentScale.y), 1e-9);
+}
+
 function updateLabelSprites(root) {
   if (mode === 'ar') {
-    // Target world height in metres, independent of pinch: local = world / modelScale
-    // because labels live under floatRoot.scale = modelScale.
     const worldH = AR_LABEL_LINE_M * labelSizeMul;
-    const inv = 1 / Math.max(modelScale, 1e-6);
     let sample = null;
     root.traverse((c) => {
       if (!c.isSprite || !c.userData.isLabel) return;
       c.quaternion.copy(camera.quaternion);
-      // Uniform line height in AR (ignore decorative scaleMul) so every plate is ~1.8 cm
+      const parentSy = parentWorldScaleY(c); // includes scaleRoot / any other parents
       const hWorld = worldH;
       const wWorld = hWorld * (c.userData.aspect || 1);
-      c.scale.set(wWorld * inv, hWorld * inv, 1);
+      c.scale.set(wWorld / parentSy, hWorld / parentSy, 1);
       if (!sample) {
+        c.updateWorldMatrix(true, false);
+        c.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), _worldScale);
         sample = {
           textAspect: c.userData.aspect,
-          scaleMul: c.userData.scaleMul,
           canvasW: c.userData.canvasW,
           canvasH: c.userData.canvasH,
           localSx: c.scale.x,
           localSy: c.scale.y,
-          worldW: wWorld,
-          worldH: hWorld,
+          parentSy,
+          matrixWorldSy: Math.abs(_worldScale.y),
+          targetWorldH: hWorld,
           modelScale,
-          floatRootScale: floatRoot.scale.x,
+          scaleRootScale: scaleRoot.scale.x,
+          sizeAttenuation: c.material.sizeAttenuation,
         };
       }
     });
     if (sample) {
-      const key = `${sample.worldH.toFixed(4)}@${modelScale.toFixed(3)}x${labelSizeMul.toFixed(2)}`;
+      const key = `${sample.targetWorldH.toFixed(4)}@${modelScale.toFixed(3)}x${labelSizeMul.toFixed(2)}`;
       if (key !== arLabelSizeLog.lastKey) {
         arLabelSizeLog.lastKey = key;
         arLabelSizeLog.samples.push(sample);
-        // eslint-disable-next-line no-console
         console.info(
-          `[labels:AR] worldH=${sample.worldH.toFixed(4)} m (${(sample.worldH * 100).toFixed(2)} cm)` +
-          ` worldW=${sample.worldW.toFixed(4)} m` +
-          ` localSy=${sample.localSy.toFixed(5)} modelScale=${sample.modelScale.toFixed(3)}` +
-          ` labelSizeMul=${labelSizeMul.toFixed(2)}` +
-          ` (canvas ${sample.canvasW}×${sample.canvasH}, aspect ${sample.textAspect.toFixed(2)})`
+          `[labels:AR] targetH=${sample.targetWorldH.toFixed(4)} m (${(sample.targetWorldH * 100).toFixed(2)} cm)` +
+          ` matrixWorld.sy=${sample.matrixWorldSy.toFixed(5)}` +
+          ` localSy=${sample.localSy.toFixed(5)} parentSy=${sample.parentSy.toFixed(5)}` +
+          ` modelScale=${sample.modelScale.toFixed(3)} mul=${labelSizeMul.toFixed(2)}` +
+          ` sizeAttenuation=${sample.sizeAttenuation}` +
+          ` canvas ${sample.canvasW}×${sample.canvasH}`
         );
-        // Expose last sample for headless checks
         globalThis.__arLabelSize = sample;
       }
     }
     return;
   }
 
-  // Fallback: previous behaviour, with optional size multiplier from the slider
   const k = THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX) * labelSizeMul;
   root.traverse((c) => {
     if (!c.isSprite || !c.userData.isLabel) return;
@@ -488,7 +506,7 @@ const SIBLINGS = [
     id: 'HD 162826',
     note: 'candidate · Ramírez+2014',
     status: 'Unlikely (Martínez-Barbosa+2016)',
-    // ℓ=66.064°, b=+28.060°, d=33.26 pc
+    // ℓ=66.064°, b=+28.060°, Gaia DR3 ϖ=30.068 mas → d=33.26 pc
     xyz: [0.01191, 0.02683, 0.01565],
     color: 0x7ec8ff,
   },
@@ -496,16 +514,17 @@ const SIBLINGS = [
     id: 'HD 186302',
     note: 'AMBRE twin · Adibekyan+2018',
     status: 'Unlikely without strong GMC (Webb+2020)',
-    // ℓ=325.271°, b=−30.272°, d=56.72 pc
+    // ℓ=325.271°, b=−30.272°, Gaia DR3 ϖ=17.6309 mas → d=56.72 pc
     xyz: [0.04026, -0.02791, -0.02859],
     color: 0xffb86b,
   },
   {
     id: 'Solar Sibling 1',
-    note: '2MASS J19354742+4803549 · Webb+2020',
-    status: 'Top 2020 candidate; age tension (~40 Myr assoc.)',
-    // ℓ≈80.63°, b≈12.99°, d=0.36 kpc
-    xyz: [0.05714, 0.34610, 0.08091],
+    note: '2MASS J19354742+4803549 · Gaia DR3 plx',
+    status: 'Top Webb+2020 candidate; age tension (~40 Myr assoc.)',
+    // ℓ=80.6299°, b=12.9926°, Gaia DR3 ϖ=3.7853 mas → d=264.2 pc (Webb+2020 used ~0.36 kpc / DR2)
+    // source_id 2128840912955018368
+    xyz: [0.0419, 0.2540, 0.0594],
     color: 0xffe566,
   },
 ];
@@ -696,39 +715,80 @@ labelSizeSlider.addEventListener('input', () => {
   labelSizeVal.textContent = labelSizeMul.toFixed(2) + '×';
   arLabelSizeLog.lastKey = ''; // force re-log on next AR frame
 });
-labelSizeMul = parseFloat(labelSizeSlider.value) || 1;
+labelSizeMul = parseFloat(labelSizeSlider.value) || LABEL_SIZE_DEFAULT;
 labelSizeVal.textContent = labelSizeMul.toFixed(2) + '×';
 
-/** Headless / debug: report intended AR label world size (metres). */
-globalThis.__getLabelSizing = () => {
-  const worldH = AR_LABEL_LINE_M * labelSizeMul;
+/** Headless / debug: apply AR label layout and measure matrixWorld height. */
+globalThis.__measureArLabelWorld = (mul = 1, scale = 1) => {
+  const prevMode = mode;
+  const prevMul = labelSizeMul;
+  const prevScale = modelScale;
+  mode = 'ar';
+  labelSizeMul = mul;
+  modelScale = scale;
+  applyModelScale();
+  applyPivot();
+  updateLabelSprites(labelsRoot);
+  floorAnchor.updateWorldMatrix(true, true);
   let sample = null;
-  const inv = 1 / Math.max(modelScale, 1e-6);
   labelsRoot.traverse((c) => {
     if (!c.isSprite || !c.userData.isLabel || sample) return;
-    const hWorld = worldH; // uniform AR line height
-    const wWorld = hWorld * (c.userData.aspect || 1);
+    c.updateWorldMatrix(true, false);
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scl = new THREE.Vector3();
+    c.matrixWorld.decompose(pos, quat, scl);
     sample = {
       AR_LABEL_LINE_M,
       labelSizeMul,
       modelScale,
-      mode,
+      targetWorldH: AR_LABEL_LINE_M * labelSizeMul,
+      matrixWorldSy: Math.abs(scl.y),
+      matrixWorldSx: Math.abs(scl.x),
+      localSy: c.scale.y,
+      parentSy: parentWorldScaleY(c),
+      sizeAttenuation: c.material.sizeAttenuation,
       canvasW: c.userData.canvasW,
       canvasH: c.userData.canvasH,
-      aspect: c.userData.aspect,
-      scaleMul: c.userData.scaleMul,
-      worldH_m: hWorld,
-      worldW_m: wWorld,
-      worldH_cm: hWorld * 100,
-      localSy: hWorld * inv,
-      localSx: wWorld * inv,
-      fallbackSy_m: c.userData.fbSy
-        * THREE.MathUtils.clamp(camOrbitDist / LABEL_REF_ORBIT, LABEL_COMP_MIN, LABEL_COMP_MAX)
-        * labelSizeMul,
     };
   });
+  mode = prevMode;
+  labelSizeMul = prevMul;
+  modelScale = prevScale;
+  applyModelScale();
+  updateLabelSprites(labelsRoot);
   return sample;
 };
+
+/** Headless: Sun world position must stay fixed across scales + spin. */
+globalThis.__measureSunPivot = () => {
+  applyPivot();
+  const prevMode = mode;
+  mode = 'ar';
+  const sunObj = sunGroup;
+  const results = [];
+  for (const s of [0.2, 1, 20]) {
+    for (const ang of [0, 1.1, 2.7]) {
+      modelScale = s;
+      applyModelScale();
+      spinRoot.rotation.y = ang;
+      floorAnchor.updateWorldMatrix(true, true);
+      sunObj.updateWorldMatrix(true, false);
+      const p = new THREE.Vector3();
+      sunObj.getWorldPosition(p);
+      results.push({ scale: s, spin: ang, x: p.x, y: p.y, z: p.z });
+    }
+  }
+  // restore
+  modelScale = 1; applyModelScale();
+  spinRoot.rotation.y = 0;
+  mode = prevMode;
+  const ref = results.find(r => r.scale === 1 && r.spin === 0) || results[0];
+  const maxDelta = Math.max(...results.map(r => Math.hypot(r.x - ref.x, r.y - ref.y, r.z - ref.z)));
+  return { ref, results, maxDelta_m: maxDelta, within_1mm: maxDelta < 0.001 };
+};
+
+globalThis.__getLabelSizing = () => globalThis.__measureArLabelWorld(labelSizeMul, modelScale);
 
 function setViewMode(mode) {
   viewMode = mode;
@@ -787,7 +847,7 @@ let pinchStartCamDist = 1.55;
 let pinchStartModelScale = 1;
 
 function applyModelScale() {
-  floatRoot.scale.setScalar(modelScale);
+  scaleRoot.scale.setScalar(modelScale);
 }
 applyModelScale();
 

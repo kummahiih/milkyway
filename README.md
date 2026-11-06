@@ -20,9 +20,9 @@ If that URL 404s, enable Pages once: repo **Settings → Pages → Source: GitHu
 
 | Star | Distance | Notes |
 |------|----------|--------|
-| HD 162826 | ~33 pc | Ramírez et al. 2014; low dynamical odds in Martínez-Barbosa et al. 2016 |
-| HD 186302 | ~57 pc | Adibekyan et al. 2018 (AMBRE); unlikely in Webb et al. 2020 without a strong GMC kick |
-| Solar Sibling 1 (2MASS J19354742+4803549) | ~0.36 kpc | Top candidate in Webb et al. 2020; later age tension |
+| HD 162826 | ~33.3 pc (Gaia DR3 ϖ=30.068 mas) | Ramírez et al. 2014; low dynamical odds in Martínez-Barbosa et al. 2016 |
+| HD 186302 | ~56.7 pc (Gaia DR3 ϖ=17.6309 mas) | Adibekyan et al. 2018 (AMBRE); unlikely in Webb et al. 2020 without a strong GMC kick |
+| Solar Sibling 1 (2MASS J19354742+4803549) | ~264 pc (Gaia DR3 ϖ=3.7853 mas; Webb+2020 used ~0.36 kpc / DR2) | Top candidate in Webb et al. 2020; later age tension |
 
 Birth radius marker ~5 kpc (Ratcliffe et al. 2024 ≈4.5±0.4 kpc; Baba et al. 2024 ≈5 kpc; other work ~7 kpc). Dispersal band is a schematic ~5–11 kpc annulus after disc scattering (Webb et al. 2020).
 
