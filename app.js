@@ -29,6 +29,10 @@ const labelSizeSlider = document.getElementById('labelSizeSlider');
 const labelSizeVal = document.getElementById('labelSizeVal');
 const markerSizeSlider = document.getElementById('markerSizeSlider');
 const markerSizeVal = document.getElementById('markerSizeVal');
+const btnBubble = document.getElementById('btnBubble');
+const btnMenu = document.getElementById('btnMenu');
+const btnMenuClose = document.getElementById('btnMenuClose');
+const menuPanel = document.getElementById('menuPanel');
 const permOverlay = document.getElementById('permOverlay');
 const btnPerm = document.getElementById('btnPerm');
 const canvas = document.getElementById('c');
@@ -44,6 +48,24 @@ let labelsVisible = true;
 let armsVisible = true;
 let pivotMode = 'sun'; // 'sun' | 'galaxy' — AR/fallback placed point
 let infoOpen = false;
+let bubbleVisible = true;
+let menuOpen = false;
+let bubbleGroup = null; // set in buildLocalView
+
+function setMenuOpen(on) {
+  menuOpen = !!on;
+  if (menuPanel) menuPanel.classList.toggle('is-hidden', !menuOpen);
+  if (btnMenu) {
+    btnMenu.setAttribute('aria-expanded', menuOpen ? 'true' : 'false');
+    btnMenu.classList.toggle('on', menuOpen);
+  }
+}
+
+function setBubbleVisible(on) {
+  bubbleVisible = !!on;
+  if (bubbleGroup) bubbleGroup.visible = bubbleVisible;
+  if (btnBubble) btnBubble.classList.toggle('on', bubbleVisible);
+}
 
 function applyPivot() {
   // Offset is under spinRoot & scaleRoot, so world pivot = floatRoot origin for any scale/spin.
@@ -704,6 +726,59 @@ galaxyRoot.add(sunGroup);
 addOverlayDot(sunGroup, { kind: 'sun', color: 0xffe566, view: 'galaxy' });
 addOverlayLabel(sunGroup, 'Sun · Orion Spur · 8.2 kpc', { view: 'galaxy', ox: 16, oy: -18 });
 
+// ——— Sun motion (galaxy view) ———
+// Basis at Sun: radial = GC→Sun, rot = Galactic rotation (+ℓ≈90°), up = NGP
+const _sunRadial = new THREE.Vector3(Math.cos(sunTheta), 0, Math.sin(sunTheta));
+const _sunRot = new THREE.Vector3(-Math.sin(sunTheta), 0, Math.cos(sunTheta));
+const _sunUp = new THREE.Vector3(0, 1, 0);
+// Circular / orbital speed toward ℓ=90°, b=0 (~220–240 km/s; arrow uses 230)
+const VCIRC_KMS = 230;
+const ORBIT_ARROW_M = 0.055;
+const motionRoot = new THREE.Group();
+motionRoot.position.copy(sunPos);
+galaxyRoot.add(motionRoot);
+{
+  const dir = _sunRot.clone().normalize();
+  const ah = new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0), ORBIT_ARROW_M, 0xffc04d, 0.012, 0.007);
+  motionRoot.add(ah);
+  const lab = makeAnchor();
+  lab.position.copy(dir.multiplyScalar(ORBIT_ARROW_M * 1.08));
+  motionRoot.add(lab);
+  addOverlayLabel(lab, 'Orbit ~230 km/s → ℓ≈90°', { view: 'galaxy', ox: 8, oy: -14 });
+}
+// Solar apex: Schönrich, Binney & Dehnen 2010 (U,V,W)=(11.1, 12.24, 7.25) km/s
+const SOLAR_U = 11.1, SOLAR_V = 12.24, SOLAR_W = 7.25;
+const APEX_SPEED = Math.hypot(SOLAR_U, SOLAR_V, SOLAR_W); // ~18.0 km/s
+const APEX_ARROW_M = 0.038;
+{
+  // UVW → world: U toward GC (= −radial), V along rot, W toward NGP
+  const dir = new THREE.Vector3()
+    .addScaledVector(_sunRadial, -SOLAR_U)
+    .addScaledVector(_sunRot, SOLAR_V)
+    .addScaledVector(_sunUp, SOLAR_W)
+    .normalize();
+  const ah = new THREE.ArrowHelper(dir, new THREE.Vector3(0, 0, 0), APEX_ARROW_M, 0x5dffc0, 0.01, 0.006);
+  motionRoot.add(ah);
+  const lab = makeAnchor();
+  lab.position.copy(dir.clone().multiplyScalar(APEX_ARROW_M * 1.1));
+  motionRoot.add(lab);
+  addOverlayLabel(lab, `Apex ~${APEX_SPEED.toFixed(0)} km/s (SB10)`, { view: 'galaxy', ox: 8, oy: -14 });
+}
+// ~1 Myr ahead along circular orbit: 230 km/s × 1.023 pc/(km/s)/Myr ≈ 235 pc
+const MYR_PC = VCIRC_KMS * 1.023;
+const futurePos = sunPos.clone().addScaledVector(_sunRot, (MYR_PC / 1000) * M_PER_KPC);
+{
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints([sunPos, futurePos]),
+    new THREE.LineBasicMaterial({ color: 0xffc04d, transparent: true, opacity: 0.55 })
+  );
+  galaxyRoot.add(line);
+  const tick = makeMarker(0xffc04d, 0.0045);
+  tick.position.copy(futurePos);
+  galaxyRoot.add(tick);
+  addOverlayLabel(tick, `~1 Myr (~${MYR_PC.toFixed(0)} pc)`, { view: 'galaxy', ox: 8, oy: -14 });
+}
+
 const centreMarker = makeMarker(0xff8866, 0.009);
 galaxyRoot.add(centreMarker);
 addOverlayLabel(centreMarker, 'Galactic centre', { view: 'galaxy', ox: 14, oy: -16 });
@@ -851,6 +926,119 @@ function buildLocalView() {
       new THREE.LineBasicMaterial({ color: sib.color, transparent: true, opacity: 0.35 })
     );
     localRoot.add(line);
+  }
+
+  // ——— Local Bubble (illustrative shell; Zucker+2022 / Pelgrims+2020 / Lallement–Vergely) ———
+  bubbleGroup = new THREE.Group();
+  bubbleGroup.visible = bubbleVisible;
+  localRoot.add(bubbleGroup);
+  {
+    const R_XY = 0.155 * LOCAL_M_PER_KPC; // ~155 pc (Zucker+2022 R≈165±6 pc)
+    const R_Z = 0.24 * LOCAL_M_PER_KPC;  // chimney stretch ⊥ plane
+    const R_Y_PLANE = 0.17 * LOCAL_M_PER_KPC;
+    const geo = new THREE.SphereGeometry(1, 56, 40);
+    const attr = geo.attributes.position;
+    const brng = mulberry32(0xb0bb1e55);
+    for (let i = 0; i < attr.count; i++) {
+      let x = attr.getX(i), y = attr.getY(i), z = attr.getZ(i);
+      const n =
+        1 +
+        0.14 * Math.sin(3.2 * x + 2.1 * z) * Math.cos(2.7 * y) +
+        0.09 * Math.sin(5.5 * z - 4.0 * x + y) +
+        (brng() - 0.5) * 0.07;
+      // Y = NGP (chimney); XZ in the plane of the disc (localRoot basis)
+      attr.setXYZ(i, x * R_XY * n, y * R_Z * n, z * R_Y_PLANE * n);
+    }
+    attr.needsUpdate = true;
+    geo.computeVertexNormals();
+    bubbleGroup.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+      color: 0x7ec8ff, transparent: true, opacity: 0.11,
+      side: THREE.DoubleSide, depthWrite: false,
+    })));
+    bubbleGroup.add(new THREE.Mesh(geo.clone(), new THREE.MeshBasicMaterial({
+      color: 0xa8dcff, transparent: true, opacity: 0.22,
+      wireframe: true, depthWrite: false,
+    })));
+    const bubLab = makeAnchor();
+    bubLab.position.set(0, R_Z * 0.92, 0);
+    bubbleGroup.add(bubLab);
+    addOverlayLabel(bubLab, 'Local Bubble ~300 pc (approx.)', { view: 'local', ox: 8, oy: -14 });
+  }
+
+  // Local Interstellar Cloud — tiny marker near Sun
+  {
+    const lic = helioToLocal(0.004, -0.002, 0.001);
+    const m = makeMarker(0xffe8a0, 0.008);
+    m.position.copy(lic);
+    bubbleGroup.add(m);
+    addOverlayLabel(m, 'LIC (schematic)', { view: 'local', ox: 10, oy: -12 });
+  }
+
+  // Nearby SF regions on bubble surface (approx. ℓ,b,d — Zucker+2022)
+  const SF_REGIONS = [
+    { name: 'Taurus', l: 174, b: -15, d: 0.140 },
+    { name: 'Ophiuchus', l: 353, b: 17, d: 0.140 },
+    { name: 'Lupus', l: 338, b: 10, d: 0.155 },
+    { name: 'Chamaeleon', l: 297, b: -16, d: 0.180 },
+    { name: 'Corona Australis', l: 0, b: -18, d: 0.150 },
+  ];
+  for (const sf of SF_REGIONS) {
+    const l = (sf.l * Math.PI) / 180;
+    const b = (sf.b * Math.PI) / 180;
+    const x = sf.d * Math.cos(b) * Math.cos(l); // toward GC
+    const y = sf.d * Math.cos(b) * Math.sin(l); // along rotation
+    const z = sf.d * Math.sin(b);               // NGP
+    const p = helioToLocal(x, y, z);
+    const m = makeMarker(0xff88cc, 0.01);
+    m.position.copy(p);
+    bubbleGroup.add(m);
+    addOverlayLabel(m, sf.name, { view: 'local', ox: 10, oy: -12 });
+  }
+
+  // Radcliffe Wave — schematic arc near the Local Bubble (illustrative)
+  {
+    const pts = [];
+    for (let i = 0; i <= 40; i++) {
+      const t = i / 40;
+      const ang = -0.9 + t * 2.4;
+      const r = 0.22 + 0.04 * Math.sin(t * Math.PI * 2);
+      const z = 0.02 * Math.sin(t * Math.PI * 3);
+      const x = r * Math.cos(ang);
+      const y = r * Math.sin(ang);
+      pts.push(helioToLocal(x, y, z));
+    }
+    const wave = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(pts),
+      new THREE.LineBasicMaterial({ color: 0x99aaff, transparent: true, opacity: 0.4 })
+    );
+    bubbleGroup.add(wave);
+    const wLab = makeAnchor();
+    wLab.position.copy(pts[Math.floor(pts.length / 2)]);
+    bubbleGroup.add(wLab);
+    addOverlayLabel(wLab, 'Radcliffe Wave (schematic)', { view: 'local', ox: 8, oy: -12 });
+  }
+
+  // Local-view motion arrows (apex especially meaningful vs nearby stars)
+  {
+    const apexDir = new THREE.Vector3()
+      .addScaledVector(new THREE.Vector3(Math.cos(sunTheta), 0, Math.sin(sunTheta)), -SOLAR_U)
+      .addScaledVector(new THREE.Vector3(-Math.sin(sunTheta), 0, Math.cos(sunTheta)), SOLAR_V)
+      .addScaledVector(new THREE.Vector3(0, 1, 0), SOLAR_W)
+      .normalize();
+    const len = 0.22;
+    localRoot.add(new THREE.ArrowHelper(apexDir, new THREE.Vector3(0, 0, 0), len, 0x5dffc0, 0.04, 0.025));
+    const lab = makeAnchor();
+    lab.position.copy(apexDir.clone().multiplyScalar(len * 1.05));
+    localRoot.add(lab);
+    addOverlayLabel(lab, `Apex ~${APEX_SPEED.toFixed(0)} km/s`, { view: 'local', ox: 8, oy: -14 });
+
+    const orbitDir = new THREE.Vector3(-Math.sin(sunTheta), 0, Math.cos(sunTheta)).normalize();
+    const oLen = 0.28;
+    localRoot.add(new THREE.ArrowHelper(orbitDir, new THREE.Vector3(0, 0, 0), oLen, 0xffc04d, 0.045, 0.028));
+    const oLab = makeAnchor();
+    oLab.position.copy(orbitDir.clone().multiplyScalar(oLen * 1.05));
+    localRoot.add(oLab);
+    addOverlayLabel(oLab, 'Orbit ~230 km/s', { view: 'local', ox: 8, oy: -14 });
   }
 }
 buildLocalView();
@@ -1240,7 +1428,7 @@ function endPointer(id) {
 
 function onPointerDown(e) {
   // Ignore UI controls
-  if (e.target.closest && e.target.closest('#ui, #info, #permOverlay, button, input, label, a')) return;
+  if (e.target.closest && e.target.closest('#menuPanel, #btnMenu, #info, #permOverlay, #buildTag, button, input, label, a')) return;
   if (e.pointerType === 'mouse' && e.button !== 0) return;
   activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   try { (e.target === canvas ? canvas : document.body).setPointerCapture?.(e.pointerId); } catch (_) {}
@@ -1426,6 +1614,28 @@ btnInfo.addEventListener('click', () => {
   infoEl.classList.toggle('show', infoOpen);
   btnInfo.classList.toggle('on', infoOpen);
 });
+if (btnBubble) {
+  btnBubble.addEventListener('click', () => setBubbleVisible(!bubbleVisible));
+}
+if (btnMenu) {
+  btnMenu.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setMenuOpen(!menuOpen);
+  });
+}
+if (btnMenuClose) {
+  btnMenuClose.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+  });
+}
+// Menu taps must not place / pinch (AR dom-overlay)
+for (const el of [menuPanel, btnMenu].filter(Boolean)) {
+  for (const ev of ['pointerdown', 'pointerup', 'pointermove', 'touchstart', 'touchmove', 'click', 'wheel']) {
+    el.addEventListener(ev, (e) => e.stopPropagation(), { passive: false });
+  }
+}
+setMenuOpen(false);
 btnDebug.addEventListener('click', () => {
   debugVisible = !debugVisible;
   debugLine.classList.toggle('is-hidden', !debugVisible);
