@@ -37,3 +37,8 @@ Single file: `index.html` (three.js via CDN import map).
 ## License
 
 Use freely for personal / educational viewing.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). Threat model: [docs/threat-model-stride.md](docs/threat-model-stride.md). Dependency scan: [docs/dependency-scan.md](docs/dependency-scan.md).
+
